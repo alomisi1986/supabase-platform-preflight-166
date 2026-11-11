@@ -1,0 +1,790 @@
+# DRAFT_NOT_PUBLISHED_NOT_RUN (revision 531) - platform-only preflight for supabase/postgres 17.6.1.166
+# Purpose: start the official Supabase local database (CLI v3.1.0 `supabase db start`) on an EMPTY
+# database with api.auto_expose_new_tables=false, then read catalog metadata only.
+# Boundary: the CLI (as a run-created unprivileged user) and one dedicated container engine run
+# inside a run-created network namespace with no uplink. Runner services are not stopped or changed.
+# Contains no project data, identifiers, secrets, application migrations, seeds or roles.
+name: platform-preflight-17-6-1-166
+
+on:
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: platform-preflight
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CLI_VERSION: "3.1.0"
+      CLI_URL: "https://github.com/supabase/cli/releases/download/v3.1.0/supabase_3.1.0_linux_amd64.tar.gz"
+      CLI_SHA256: "dbe9fd66771337fc198727da86b9d3551302f87a7091cd8781be2a4cd0c8ac4d"
+      PG_PIN: "17.6.1.166"
+      IMAGE_NAME: "supabase/postgres"
+      IMAGE_INDEX: "sha256:b3bfedb107413abb3b8cb0d0874b0414a1dceb3d55bc0c778de6ad22d1f7dc86"
+      IMAGE_AMD64: "sha256:d5424e9f4d0c21d63991c3f3dd77881f23f722c3a212452a61bc91924b79e8c8"
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      # ------------------------------------------------------------------ 0. guard + fixed helpers (creates nothing outside RUNNER_TEMP)
+      - name: 0-guard-and-helpers
+        timeout-minutes: 3
+        run: |
+          RT="$RUNNER_TEMP"
+          cat > "$RT/lib.sh" <<'LIB'
+          RT="$RUNNER_TEMP"
+          NS="pf530"
+          TU="pf530"
+          R="/var/lib/pf530"
+          RR="/run/pf530"
+          EN="/etc/netns/pf530"
+          SOCKP="/run/pf530/docker.sock"
+          SOCK="unix:///run/pf530/docker.sock"
+          PROJ="pf530proj"
+          NET="supabase_network_pf530proj"
+          W="/var/lib/pf530/work/pf530proj"
+          LEDGER="$RT/ledger"
+          # first stop reason wins and is kept for the cleanup report
+          stop() { echo "$1"; if [ ! -s "$RT/stop_reason" ]; then printf '%s\n' "$1" > "$RT/stop_reason"; fi; exit 1; }
+          # ledger: an intent line is written before each creation, the identity line right after it
+          led() { printf '%s\n' "$*" >> "$LEDGER"; }
+          mkown() { led "intent pf530 kind=path target=$1"; sudo mkdir -m "$2" "$1" || stop "STOP2 path_exists_or_mkdir $1"; led "path $1 ino=$(sudo stat -c %i "$1")"; }
+          dk() { sudo docker -H "$SOCK" "$@"; }
+          in_ns() { sudo ip netns exec "$NS" "$@"; }
+          # the test user: no supplementary groups, empty environment except declared variables
+          as_user() { in_ns setpriv --reuid="$(cat "$RT/uid")" --regid="$(cat "$RT/gid")" --clear-groups \
+            env -i HOME="$R/home" PATH=/usr/local/bin:/usr/bin:/bin DOCKER_HOST="$SOCK" \
+            DO_NOT_TRACK=1 SUPABASE_TELEMETRY_DISABLED=1 SUPABASE_INTERNAL_IMAGE_REGISTRY=docker.io "$@"; }
+          # probe PHASE STOPCODE: 0 proven, 3 not proven, anything else is a probe tool error
+          probe() {
+            set +e; in_ns python3 -I "$RT/probe.py" "$1" "$EN" "$(cat "$RT/ns_ino")"; local rc=$?; set -e
+            case "$rc" in 0) ;; 3) stop "$2 isolation_not_proven phase=$1" ;; *) stop "$2 probe_tool_error phase=$1 rc=$rc" ;; esac
+          }
+          LIB
+
+          cat > "$RT/regfetch.py" <<'PY'
+          # Fetch one image by digest from Docker Hub; every byte is checked against its digest.
+          import hashlib, json, os, sys, tarfile, urllib.request
+          name, index_d, amd64_d, out, tag = sys.argv[1:6]
+          REG = "https://registry-1.docker.io"
+          IDX = ["application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"]
+          MAN = ["application/vnd.oci.image.manifest.v1+json", "application/vnd.docker.distribution.manifest.v2+json"]
+          LAYER = ["application/vnd.oci.image.layer.v1.tar+gzip", "application/vnd.docker.image.rootfs.diff.tar.gzip"]
+          def die(msg):
+              print("STOP1 " + msg); sys.exit(3)
+          def main():
+              with urllib.request.urlopen("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull" % name, timeout=60) as r:
+                  tok = json.load(r)["token"]
+              def get(path, accept=None, dest=None):
+                  req = urllib.request.Request(REG + path)
+                  req.add_unredirected_header("Authorization", "Bearer " + tok)  # never forwarded on redirect
+                  if accept:
+                      req.add_header("Accept", ", ".join(accept))
+                  h = hashlib.sha256(); n = 0; buf = []
+                  with urllib.request.urlopen(req, timeout=600) as r:
+                      f = open(dest, "wb") if dest else None
+                      while True:
+                          b = r.read(1 << 20)
+                          if not b:
+                              break
+                          h.update(b); n += len(b)
+                          f.write(b) if f else buf.append(b)
+                      if f:
+                          f.close()
+                  return b"".join(buf), n, "sha256:" + h.hexdigest()
+              idx, _, d = get("/v2/%s/manifests/%s" % (name, index_d), IDX)
+              if d != index_d: die("index_digest_mismatch")
+              ix = json.loads(idx)
+              hits = [m for m in ix.get("manifests", []) if m.get("platform", {}).get("os") == "linux" and m.get("platform", {}).get("architecture") == "amd64"]
+              if len(hits) != 1 or hits[0].get("digest") != amd64_d: die("amd64_member_mismatch")
+              man, _, d = get("/v2/%s/manifests/%s" % (name, amd64_d), MAN)
+              if d != amd64_d: die("manifest_digest_mismatch")
+              mj = json.loads(man)
+              if mj.get("mediaType", MAN[0]) not in MAN: die("manifest_media_type")
+              cfg_d = mj["config"]["digest"]
+              cfg, _, d = get("/v2/%s/blobs/%s" % (name, cfg_d))
+              if d != cfg_d: die("config_digest_mismatch")
+              cj = json.loads(cfg)
+              if cj.get("os") != "linux" or cj.get("architecture") != "amd64": die("config_platform")
+              if len(cj["rootfs"]["diff_ids"]) != len(mj["layers"]): die("layer_count")
+              os.makedirs(os.path.join(out, "blobs"))
+              cfg_name = "blobs/%s.json" % cfg_d.split(":")[1]
+              open(os.path.join(out, cfg_name), "wb").write(cfg)
+              layers = []; total = 0
+              for l in mj["layers"]:
+                  if l.get("mediaType") not in LAYER: die("layer_media_type")
+                  rel = "blobs/%s.tar.gz" % l["digest"].split(":")[1]
+                  _, n, d = get("/v2/%s/blobs/%s" % (name, l["digest"]), dest=os.path.join(out, rel))
+                  if d != l["digest"] or n != l["size"]: die("layer_digest_mismatch")
+                  layers.append(rel); total += n
+              open(os.path.join(out, "manifest.json"), "w").write(json.dumps([{"Config": cfg_name, "RepoTags": [tag], "Layers": layers}]))
+              with tarfile.open(os.path.join(out, "image.tar"), "w", format=tarfile.PAX_FORMAT) as t:
+                  for rel in ["manifest.json", cfg_name] + layers:
+                      t.add(os.path.join(out, rel), arcname=rel)
+              open(os.path.join(out, "expected_image_id"), "w").write(cfg_d + "\n")
+              print("STEP1 index=%s amd64=%s config=%s layers=%d layer_bytes=%d (all digests verified)" % (index_d, amd64_d, cfg_d, len(layers), total))
+          try:
+              main()
+          except SystemExit:
+              raise
+          except Exception as e:  # declared field only: the exception class
+              print("STEP1 fetch_error class=%s" % type(e).__name__); sys.exit(2)
+          PY
+
+          cat > "$RT/probe.py" <<'PY'
+          # Boundary probe. Exit 0: proven. Exit 3: not proven. Any other exit: tool error.
+          import errno, os, socket, sys
+          mode = sys.argv[1]
+          def code(e):
+              return errno.errorcode.get(e.errno, str(e.errno)) if getattr(e, "errno", None) else type(e).__name__
+          def conn(fam, addr, kind=socket.SOCK_STREAM):
+              try:
+                  s = socket.socket(fam, kind)
+              except OSError as e:
+                  return code(e)
+              s.settimeout(5)
+              try:
+                  s.connect(addr); return "connected"
+              except socket.timeout:
+                  return "timeout"
+              except OSError as e:
+                  return code(e)
+              finally:
+                  s.close()
+          out = {"netns": os.readlink("/proc/self/ns/net")}
+          if mode == "host":
+              out["v4_external"] = conn(socket.AF_INET, ("1.1.1.1", 443))
+              print("PROBE host " + " ".join("%s=%s" % kv for kv in out.items()))
+              sys.exit(0)
+          etc_ref, ns_ino = sys.argv[2], sys.argv[3]
+          bad = []
+          if out["netns"] != "net:[%s]" % ns_ino: bad.append("not_in_test_netns")
+          if mode == "sockets":
+              # run as the test user: host engine sockets must refuse it, the dedicated socket must accept it
+              out["uid"] = os.getuid(); out["groups"] = ",".join(map(str, os.getgroups())) or "none"
+              if os.getuid() == 0 or os.getgroups(): bad.append("identity")
+              for p in ("/var/run/docker.sock", "/run/docker.sock", "/run/containerd/containerd.sock"):
+                  r = conn(socket.AF_UNIX, p); out[p] = r
+                  if r not in ("EACCES", "ENOENT"): bad.append("host_socket " + p)
+              r = conn(socket.AF_UNIX, etc_ref); out["dedicated"] = r
+              if r != "connected": bad.append("dedicated_socket")
+          else:
+              ifs = sorted(os.listdir("/sys/class/net"))
+              ok_if = (lambda n: n == "lo") if mode == "pre_engine" else (lambda n: n in ("lo", "docker0") or n.startswith("br-") or n.startswith("veth"))
+              out["interfaces"] = ",".join(ifs)
+              if [n for n in ifs if not ok_if(n)]: bad.append("unexpected_interfaces")
+              v4 = [l.split() for l in open("/proc/net/route").read().splitlines()[1:]]
+              if any(r[1] == "00000000" for r in v4): bad.append("v4_default_route")
+              v6 = [l.split() for l in open("/proc/net/ipv6_route").read().splitlines()]
+              if any(r[1] == "00" and r[9] != "lo" for r in v6): bad.append("v6_default_route")
+              srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+              out["loopback_control"] = conn(socket.AF_INET, srv.getsockname()); srv.close()
+              if out["loopback_control"] != "connected": bad.append("loopback_control")
+              out["v4_external"] = conn(socket.AF_INET, ("1.1.1.1", 443))
+              if out["v4_external"] != "ENETUNREACH": bad.append("v4_external")
+              out["v6_external"] = conn(socket.AF_INET6, ("2606:4700:4700::1111", 443, 0, 0))
+              if out["v6_external"] not in ("ENETUNREACH", "EADDRNOTAVAIL", "EAFNOSUPPORT"): bad.append("v6_external")
+              # resolver and name-service files seen in the namespace are the run's own (no host resolver socket path)
+              for f in ("resolv.conf", "nsswitch.conf"):
+                  same = open("/etc/" + f).read() == open(os.path.join(etc_ref, f)).read()
+                  out[f.split(".")[0] + "_is_run_file"] = str(same)
+                  if not same: bad.append(f)
+              try:
+                  u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); u.bind(("127.0.0.1", 53)); u.close()
+                  out["local_dns_listener"] = "none"
+              except OSError as e:
+                  out["local_dns_listener"] = code(e); bad.append("local_dns_listener")
+              try:
+                  socket.getaddrinfo("registry-1.docker.io", 443); out["dns_lookup"] = "resolved"; bad.append("dns_lookup")
+              except socket.gaierror as e:
+                  out["dns_lookup"] = "gaierror_%s" % e.errno
+          print("PROBE %s %s" % (mode, " ".join("%s=%s" % kv for kv in out.items())))
+          if bad:
+              print("PROBE_NOT_PROVEN %s %s" % (mode, ",".join(bad))); sys.exit(3)
+          print("PROBE_PROVEN %s" % mode)
+          PY
+
+          cat > "$RT/engines.sh" <<'SH'
+          # One process starts containerd and dockerd as its children: both share one network and one mount namespace.
+          R="$1"; RR="$2"
+          containerd --config "$R/containerd.toml" --root "$R/containerd" --state "$RR/containerd" --address "$RR/containerd/containerd.sock" >"$R/logs/containerd.log" 2>&1 &
+          echo $! > "$RR/containerd.spawn.pid"
+          i=0
+          while [ ! -S "$RR/containerd/containerd.sock" ] && [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
+          dockerd --config-file "$R/daemon.json" >"$R/logs/dockerd.log" 2>&1 &
+          echo $! > "$RR/dockerd.spawn.pid"
+          wait
+          SH
+
+          cat > "$RT/cfg.py" <<'PY'
+          # config MODE: patch+verify the declared config, or check inputs. Exit 0 ok, 3 not as declared.
+          import os, re, sys, tomllib
+          mode, wd, proj = sys.argv[1:4]
+          sup = os.path.join(wd, "supabase"); p = os.path.join(sup, "config.toml")
+          OFF = ["db.migrations", "db.seed", "realtime", "studio", "local_smtp", "storage", "auth", "edge_runtime", "analytics"]
+          def die(msg):
+              print("STOP3 " + msg); sys.exit(3)
+          if mode == "patch":
+              lines = open(p, encoding="utf-8").read().split("\n"); sec = None
+              for i, l in enumerate(lines):
+                  m = re.match(r"^\[([^\]]+)\]\s*$", l)
+                  if m:
+                      sec = m.group(1); continue
+                  if sec == "api" and l == "# auto_expose_new_tables = true":
+                      lines[i] = "auto_expose_new_tables = false"
+                  elif sec in OFF and l == "enabled = true":
+                      lines[i] = "enabled = false"
+              open(p, "w", encoding="utf-8").write("\n".join(lines))
+              # the final file is judged by a TOML parser: duplicate keys are a parse error
+              try:
+                  c = tomllib.loads(open(p, encoding="utf-8").read())
+              except tomllib.TOMLDecodeError as e:
+                  pos = re.search(r"\(at line \d+, column \d+\)", str(e))
+                  die("config_parse_error %s" % (pos.group(0) if pos else "position_unknown"))
+              def get(path):
+                  v = c
+                  for k in path.split("."):
+                      if not isinstance(v, dict) or k not in v:
+                          return "ABSENT"
+                      v = v[k]
+                  return v
+              want = {"project_id": proj, "api.auto_expose_new_tables": False, "db.major_version": 17,
+                      "db.migrations.schema_paths": []}
+              want.update({s + ".enabled": False for s in OFF})
+              diff = {k: get(k) for k, v in want.items() if get(k) != v or type(get(k)) is not type(v)}
+              for k in sorted(want):
+                  print("STEP3 config %s=%r" % (k, get(k)))
+              if diff:
+                  die("config_not_as_declared %s" % sorted(diff))
+          elif mode == "inputs":
+              files = sorted(os.path.relpath(os.path.join(d, f), wd) for d, _, fs in os.walk(wd) for f in fs)
+              for f in files:
+                  print("STEP3 file %s" % f)
+              if [f for f in files if f.startswith("supabase/migrations/")]: die("migrations_present")
+              for f in ("supabase/seed.sql", "supabase/roles.sql", "supabase.lock", "supabase/supabase.lock"):
+                  if f in files: die("input_present %s" % f)
+              if open(os.path.join(sup, ".temp", "postgres-version")).read().strip() != os.environ.get("PG_PIN", "?"):
+                  die("version_pin")
+              print("STEP3 inputs migrations=0 seed_sql=absent roles_sql=absent lock=absent pin=%s" % os.environ["PG_PIN"])
+          PY
+
+          cat > "$RT/diag.py" <<'PY'
+          # Declared diagnostic fields only; no raw log text is printed.
+          import hashlib, re, sys
+          mode, path = sys.argv[1], sys.argv[2]
+          data = open(path, "rb").read(); text = data.decode("utf-8", "replace"); lines = text.splitlines()
+          PROGRESS = ["Starting database...", "Starting database from backup...", "Initialising schema...", "Seeding globals from roles.sql..."]
+          ACTIVITY = {"applying_migration": "Applying migration ", "seeding_data": "Seeding data from ", "updating_seed_hash": "Updating seed hash to "}
+          if mode == "log":
+              seen = [m for m in PROGRESS if any(l.startswith(m) for l in lines)]
+              toks = sorted(set(re.findall(r"\b[A-Z][A-Za-z0-9]*(?:Error|Exception)\b|\bE[A-Z]{3,}\b", text)))[:20]
+              print("DIAG %s bytes=%d sha256=%s lines=%d progress_markers=%s error_identifiers=%s" % (
+                  sys.argv[3], len(data), hashlib.sha256(data).hexdigest(), len(lines), "|".join(seen) or "none", ",".join(toks) or "none"))
+          elif mode == "activity":
+              n = {k: sum(1 for l in lines if l.startswith(v)) for k, v in ACTIVITY.items()}
+              print("STEP4 %s roles_announce_line=%s (expected: printed before the roles.sql existence check)" % (
+                  " ".join("%s=%d" % kv for kv in n.items()), any(l.startswith(PROGRESS[3]) for l in lines)))
+              sys.exit(3 if any(n.values()) else 0)
+          elif mode == "psql":
+              hits = re.findall(r"^psql:<stdin>:(\d+): ERROR:\s+([0-9A-Z]{5})\s*$", text, re.M)
+              if hits:
+                  print("DIAG psql " + " ".join("sql_line=%s sqlstate=%s" % h for h in hits))
+              elif any(l.startswith("psql: error:") for l in lines):
+                  print("DIAG psql connection_error")
+              else:
+                  print("DIAG psql unclassified stderr_lines=%d" % len(lines))
+          PY
+
+          cat > "$RT/measure.sql" <<'SQL'
+          BEGIN TRANSACTION READ ONLY;
+          SELECT 'M tx', current_setting('transaction_read_only');
+          SELECT 'M identity', current_database(), session_user, current_user, current_setting('server_version'), pg_get_userbyid(d.datdba) FROM pg_database d WHERE d.datname = current_database();
+          SELECT 'M version', version();
+          SELECT 'M role', v.n, CASE WHEN r.oid IS NULL THEN 'absent' ELSE 'present' END, coalesce(r.rolsuper::text, '-'), coalesce(r.rolcanlogin::text, '-'), coalesce(r.rolbypassrls::text, '-'), coalesce(r.rolinherit::text, '-')
+            FROM (VALUES ('anon'), ('authenticated'), ('postgres'), ('service_role')) v(n) LEFT JOIN pg_roles r ON r.rolname = v.n ORDER BY v.n;
+          SELECT 'M ext', v.n, coalesce(e.extversion, 'absent'), coalesce(ns.nspname, '-'), coalesce(a.default_version, 'absent')
+            FROM (VALUES ('btree_gist'), ('pgcrypto')) v(n) LEFT JOIN pg_extension e ON e.extname = v.n LEFT JOIN pg_namespace ns ON ns.oid = e.extnamespace
+            LEFT JOIN pg_available_extensions a ON a.name = v.n ORDER BY v.n;
+          SET LOCAL search_path = public, pg_temp;
+          SELECT 'M resolve', coalesce(to_regprocedure('gen_random_bytes(integer)')::text, 'NOT_RESOLVED'), coalesce(to_regprocedure('extensions.gen_random_bytes(integer)')::text, 'NOT_RESOLVED');
+          RESET search_path;
+          SELECT 'M defacl', t.k, v.n, coalesce((SELECT string_agg(a.privilege_type, ',' ORDER BY a.privilege_type)
+                 FROM pg_default_acl d, LATERAL aclexplode(d.defaclacl) a
+                WHERE d.defaclrole = 'postgres'::regrole AND d.defaclnamespace = 'public'::regnamespace AND d.defaclobjtype = t.k::"char" AND a.grantee = r.oid), 'none')
+            FROM (VALUES ('S'), ('f'), ('r')) t(k) CROSS JOIN (VALUES ('anon'), ('authenticated'), ('service_role')) v(n) LEFT JOIN pg_roles r ON r.rolname = v.n ORDER BY t.k, v.n;
+          SELECT 'M defacl_rows_postgres_global', count(*) FROM pg_default_acl WHERE defaclrole = 'postgres'::regrole AND defaclnamespace = 0;
+          SELECT 'M public_relations', count(*) FROM pg_class WHERE relnamespace = 'public'::regnamespace;
+          SELECT 'M public_functions', count(*) FROM pg_proc WHERE pronamespace = 'public'::regnamespace;
+          SELECT 'M public_types_explicit', count(*) FROM pg_type t WHERE t.typnamespace = 'public'::regnamespace AND t.typtype IN ('d', 'e', 'r', 'm', 'b') AND t.typelem = 0;
+          SELECT 'M migrations_recorded', CASE WHEN to_regclass('supabase_migrations.schema_migrations') IS NULL THEN 'absent'
+            ELSE (xpath('/row/c/text()', query_to_xml('SELECT count(*) AS c FROM supabase_migrations.schema_migrations', false, true, '')))[1]::text END;
+          SELECT 'M seeds_recorded', CASE WHEN to_regclass('supabase_migrations.seed_files') IS NULL THEN 'absent'
+            ELSE (xpath('/row/c/text()', query_to_xml('SELECT count(*) AS c FROM supabase_migrations.seed_files', false, true, '')))[1]::text END;
+          SELECT 'M end', 'complete';
+          ROLLBACK;
+          SQL
+
+          cat > "$RT/compare.py" <<'PY'
+          # Exit 5: evidence incomplete or invalid. Exit 0: complete; each item is MATCH, DIFF, ABSENT or MEASURED.
+          import sys
+          ROLES = ["anon", "authenticated", "postgres", "service_role"]
+          API = ["anon", "authenticated", "service_role"]
+          SPEC = {"M tx": (0, 1, None), "M identity": (0, 5, None), "M version": (0, 1, None),
+                  "M role": (1, 6, {(r,) for r in ROLES}), "M ext": (1, 4, {("btree_gist",), ("pgcrypto",)}),
+                  "M resolve": (0, 2, None), "M defacl": (2, 3, {(k, r) for k in "Sfr" for r in API}),
+                  "M defacl_rows_postgres_global": (0, 1, None), "M public_relations": (0, 1, None), "M public_functions": (0, 1, None),
+                  "M public_types_explicit": (0, 1, None), "M migrations_recorded": (0, 1, None), "M seeds_recorded": (0, 1, None),
+                  "M end": (0, 1, None)}
+          lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+          got = {}; invalid = []
+          for n, l in enumerate(lines, 1):
+              f = l.split(" | ")
+              spec = SPEC.get(f[0])
+              if spec is None or len(f) - 1 != spec[1]:
+                  invalid.append("line%d_shape" % n); continue
+              key = (f[0],) + tuple(f[1:1 + spec[0]])
+              if key in got:
+                  invalid.append("line%d_duplicate" % n); continue
+              got[key] = f[1:]
+          missing = [k for k, (kc, _, keys) in SPEC.items() if (keys is None and (k,) not in got) or (keys is not None and any((k,) + kk not in got for kk in keys))]
+          if not lines or lines[-1] != "M end | complete": missing.append("end_marker_last")
+          if invalid or missing:
+              print("MEASURE_COMPLETE=no evidence_invalid=%s evidence_missing=%s" % (",".join(invalid) or "none", ",".join(missing) or "none"))
+              sys.exit(5)
+          print("MEASURE_COMPLETE=yes rows=%d" % len(lines))
+          res = []
+          def item(name, measured, expected=None, absent=False):
+              st = "ABSENT" if absent else ("MEASURED" if expected is None else ("MATCH" if measured == expected else "DIFF"))
+              res.append(st); print("RESULT %s measured=%s expected=%s %s" % (name, measured, "-" if expected is None else expected, st))
+          i = got[("M identity",)]
+          for nm, v in zip(["database", "session_user", "current_user", "server_version", "database_owner"], i):
+              item("identity_" + nm, v, {"database": "postgres", "session_user": "postgres", "current_user": "postgres", "database_owner": "postgres"}.get(nm))
+          item("server_version_prefix", i[3][:4], "17.6")
+          item("version_string", got[("M version",)][0])
+          item("transaction_read_only", got[("M tx",)][0], "on")
+          for r in ROLES:
+              v = got[("M role", r)]
+              item("role_" + r, "present super=%s login=%s bypassrls=%s inherit=%s" % tuple(v[2:]) if v[1] == "present" else "absent", None, absent=v[1] != "present")
+          pg = got[("M ext", "pgcrypto")]; bg = got[("M ext", "btree_gist")]
+          item("ext_pgcrypto_installed", "%s in %s" % (pg[1], pg[2]), "1.3 in extensions", absent=pg[1] == "absent")
+          item("ext_pgcrypto_available", pg[3], None, absent=pg[3] == "absent")
+          item("ext_btree_gist_installed", bg[1], "absent")
+          item("ext_btree_gist_available", bg[3], None, absent=bg[3] == "absent")
+          rv = got[("M resolve",)]
+          item("gen_random_bytes_unqualified", rv[0], "NOT_RESOLVED")
+          item("gen_random_bytes_qualified", "resolved" if rv[1] != "NOT_RESOLVED" else "NOT_RESOLVED", "resolved")
+          want = {"r": "MAINTAIN,REFERENCES,TRIGGER,TRUNCATE", "f": "none", "S": "UPDATE"}
+          for k in "rfS":
+              for r in API:
+                  item("defacl_%s_%s" % (k, r), got[("M defacl", k, r)][2], want[k], absent=got[("M role", r)][1] != "present")
+          item("defacl_rows_postgres_global", got[("M defacl_rows_postgres_global",)][0])
+          for k in ("public_relations", "public_functions", "public_types_explicit"):
+              item(k, got[("M " + k,)][0], "0")
+          for k in ("migrations_recorded", "seeds_recorded"):
+              v = got[("M " + k,)][0]
+              item(k, v, v if v in ("absent", "0") else "absent_or_0")
+          print("RESULT_SUMMARY " + " ".join("%s=%d" % (s, res.count(s)) for s in ("MATCH", "DIFF", "ABSENT", "MEASURED")) + " (a difference is recorded, not a stop)")
+          PY
+
+          cat > "$RT/cleanup.py" <<'PY'
+          # Cleanup from the ledger only: a resource is acted on only while its recorded identity still matches.
+          import grp, os, pwd, signal, subprocess, sys, time
+          ledger, rt = sys.argv[1], sys.argv[2]
+          SOCK = "unix:///run/pf530/docker.sock"; R = "/var/lib/pf530"; RR = "/run/pf530"
+          def parse():
+              out = []
+              if os.path.exists(ledger):
+                  for l in open(ledger).read().splitlines():
+                      t = l.split()
+                      if len(t) >= 2:
+                          out.append((t[0], t[1], dict(x.split("=", 1) for x in t[2:] if "=" in x)))
+              return out
+          ent = parse()
+          if not ent:
+              print("STEP6 no_resources_recorded actions=0"); sys.exit(0)
+          errors = 0; unverified = 0
+          def run(name, cmd):
+              global errors
+              r = subprocess.run(cmd, capture_output=True, text=True)
+              print("CLEANUP action=%s rc=%d" % (name, r.returncode)); errors += r.returncode != 0
+              return r
+          def rec(kind, name=None):
+              return [e for e in ent if e[0] == kind and (name is None or e[1] == name)]
+          def ino(p):
+              try:
+                  return str(os.lstat(p).st_ino)
+              except FileNotFoundError:
+                  return None
+          def nsino(n):
+              try:
+                  return str(os.stat("/run/netns/" + n).st_ino)
+              except FileNotFoundError:
+                  return None
+          def nspids(n):
+              r = subprocess.run(["ip", "netns", "pids", n], capture_output=True, text=True)
+              return None if r.returncode else [int(p) for p in r.stdout.split()]
+          def exe(p):
+              try:
+                  return os.path.basename(os.readlink("/proc/%d/exe" % p))
+              except OSError:
+                  return "?"
+          def reap(n):
+              global errors
+              def wait(sel, secs):
+                  end = time.time() + secs
+                  while time.time() < end and [p for p in (nspids(n) or []) if sel(p)]:
+                      time.sleep(1)
+              first = nspids(n) or []
+              print("CLEANUP reap_initial=%d %s" % (len(first), " ".join("%d:%s" % (p, exe(p)) for p in first)))
+              for p in first:
+                  if exe(p) == "dockerd":
+                      os.kill(p, signal.SIGTERM)
+              wait(lambda p: exe(p) == "dockerd", 90)
+              for sig, secs in ((signal.SIGTERM, 30), (signal.SIGKILL, 10)):
+                  for p in nspids(n) or []:
+                      try:
+                          os.kill(p, sig)
+                      except ProcessLookupError:
+                          pass
+                  wait(lambda p: True, secs)
+              left = nspids(n)
+              print("CLEANUP reap_remaining=%s" % ("unknown" if left is None else len(left))); errors += left != []
+          # 1. containers, only when an engine was recorded: inventory by the engine API (exit status checked)
+          #    and, independently, by the run-owned data root on disk; an empty list counts only from a successful inventory
+          inv_api = inv_disk = None
+          if rec("engine"):
+              root = rec("path", R)
+              if root and ino(R) == root[0][2].get("ino"):
+                  try:
+                      inv_disk = sorted(x for x in os.listdir(os.path.join(R, "docker", "containers"))
+                                        if len(x) == 64 and all(ch in "0123456789abcdef" for ch in x))
+                  except OSError:
+                      inv_disk = None
+                  r = subprocess.run(["docker", "-H", SOCK, "info", "--format", "{{.DockerRootDir}}"], capture_output=True, text=True)
+                  if r.returncode == 0 and r.stdout.strip() == R + "/docker":
+                      ls = subprocess.run(["docker", "-H", SOCK, "ps", "-aq", "--no-trunc"], capture_output=True, text=True)
+                      if ls.returncode == 0:
+                          inv_api = ls.stdout.split()
+              ids = sorted(set((inv_api or []) + (inv_disk or [])))
+              print("CLEANUP container_inventory api=%s disk=%s ids=%d" % (
+                  "unavailable" if inv_api is None else "ok:%d" % len(inv_api), "unavailable" if inv_disk is None else "ok:%d" % len(inv_disk), len(ids)))
+              with open(ledger, "a") as f:
+                  for c in ids:
+                      f.write("container pf530 id=%s\n" % c)
+          # 2. every process in the run-owned namespace, then the namespace
+          for _, n, d in rec("netns"):
+              cur = nsino(n)
+              if cur is None:
+                  print("CLEANUP netns=%s already_absent" % n); continue
+              if cur != d.get("ino"):
+                  print("CLEANUP netns=%s identity_mismatch no_action" % n); continue
+              for c in inv_api or []:
+                  run("rm_container_" + c[:12], ["docker", "-H", SOCK, "rm", "-f", c])
+              reap(n)
+              run("netns_delete_" + n, ["ip", "netns", "del", n])
+          # 3. paths, newest first, each only if its recorded inode still matches
+          for _, p, d in reversed(rec("path")):
+              cur = ino(p)
+              if cur is None:
+                  print("CLEANUP path=%s already_absent" % p); continue
+              if cur != d.get("ino"):
+                  print("CLEANUP path=%s identity_mismatch no_action" % p); continue
+              if p == "/etc/netns":
+                  run("rmdir_" + p, ["rmdir", p])
+              elif os.path.isdir(p) and not os.path.islink(p):
+                  run("rm_" + p, ["rm", "-rf", "--one-file-system", p])
+              else:
+                  run("rm_" + p, ["rm", "-f", p])
+          # 4. the test user and its group, only with the recorded uid/gid
+          for _, u, d in rec("user"):
+              try:
+                  pw = pwd.getpwnam(u)
+                  if str(pw.pw_uid) == d.get("uid"):
+                      run("userdel_" + u, ["userdel", u])
+                  else:
+                      print("CLEANUP user=%s identity_mismatch no_action" % u)
+              except KeyError:
+                  print("CLEANUP user=%s already_absent" % u)
+              try:
+                  g = grp.getgrnam(u)
+                  if str(g.gr_gid) == d.get("gid"):
+                      run("groupdel_" + u, ["groupdel", u])
+                  else:
+                      print("CLEANUP group=%s identity_mismatch no_action" % u)
+              except KeyError:
+                  pass
+          # 5. positive verification
+          ent = parse()
+          if rec("engine"):
+              # a failed inventory stays in the tally unless the independent on-disk inventory exists;
+              # either way the process check below looks for every inventoried container id
+              note_ok = inv_api is not None or inv_disk is not None
+              print("VERIFY container_inventory api=%s disk=%s %s" % ("ok" if inv_api is not None else "unavailable",
+                    "ok" if inv_disk is not None else "unavailable", "verified" if note_ok else "UNVERIFIED"))
+              unverified += not note_ok
+          def note(item, ok, state):
+              global unverified
+              unverified += not ok
+              print("VERIFY %s %s %s" % (item, state, "verified" if ok else "UNVERIFIED"))
+          done = {(k, n) for k, n, _ in ent}
+          for _, _, d in rec("intent"):
+              k, t = d.get("kind"), d.get("target")
+              if (k, t) not in done:
+                  exists = (ino(t) is not None) if k == "path" else (nsino(t) is not None) if k == "netns" else (t in [p.pw_name for p in pwd.getpwall()])
+                  note("unproven_%s:%s" % (k, t), not exists, "present_identity_unproven" if exists else "absent")
+          for k, n, d in ent:
+              if k == "path":
+                  note("path:" + n, ino(n) is None, "absent" if ino(n) is None else "present")
+              elif k == "netns":
+                  note("netns:" + n, nsino(n) is None, "absent" if nsino(n) is None else "present")
+              elif k == "user":
+                  present = n in [p.pw_name for p in pwd.getpwall()] or n in [g.gr_name for g in grp.getgrall()]
+                  note("user_and_group:" + n, not present, "present" if present else "absent")
+          nsi = [d.get("ino") for k, _, d in ent if k == "netns"]
+          cids = [d.get("id") for k, _, d in ent if k == "container"]
+          procs = 0
+          for p in os.listdir("/proc"):
+              if not p.isdigit():
+                  continue
+              try:
+                  cmd = open("/proc/%s/cmdline" % p, "rb").read().replace(b"\0", b" ").decode("utf-8", "replace")
+                  cg = open("/proc/%s/cgroup" % p).read()
+                  net = os.readlink("/proc/%s/ns/net" % p)
+              except OSError:
+                  continue
+              if (R in cmd or RR in cmd) or any(c and c in cg for c in cids) or any(i and net == "net:[%s]" % i for i in nsi):
+                  procs += 1
+          note("processes_of_run", procs == 0, "count=%d" % procs)
+          mounts = [l.split()[4] for l in open("/proc/self/mountinfo").read().splitlines()]
+          left = [m for m in mounts if m.startswith((R, RR, "/run/netns/pf530", "/etc/netns/pf530"))]
+          note("mounts_of_run", not left, "count=%d" % len(left))
+          stop = open(os.path.join(rt, "stop_reason")).read().strip() if os.path.exists(os.path.join(rt, "stop_reason")) else "none"
+          print("STEP6 original_stop=%s cleanup_action_errors=%d unverified=%d" % (stop, errors, unverified))
+          sys.exit(0 if errors == 0 and unverified == 0 else 1)
+          PY
+
+          . "$RT/lib.sh"
+          for f in lib.sh regfetch.py probe.py engines.sh cfg.py diag.py measure.sql compare.py cleanup.py; do
+            echo "STEP0 helper $f sha256=$(sha256sum "$RT/$f" | cut -c1-64)"
+          done
+          # once per workflow: a second dispatch or a re-run attempt stops here, before any fetch or creation
+          [ "$GITHUB_RUN_NUMBER" = "1" ] && [ "$GITHUB_RUN_ATTEMPT" = "1" ] || stop "STOP0 not_first_run number=$GITHUB_RUN_NUMBER attempt=$GITHUB_RUN_ATTEMPT"
+          [ "$RUNNER_OS" = "Linux" ] && [ "$RUNNER_ARCH" = "X64" ] || stop "STOP0 unexpected_runner"
+          # no checkout: the workspace must be empty
+          [ -z "$(ls -A "$GITHUB_WORKSPACE")" ] || stop "STOP0 workspace_not_empty"
+          for t in ip python3 containerd dockerd docker ss setpriv useradd userdel groupdel curl sha256sum tar; do
+            sudo sh -c 'command -v "$1"' sh "$t" >/dev/null || stop "STOP0 tool_missing $t"
+          done
+          python3 -I -c 'import tomllib' || stop "STOP0 python_without_tomllib"
+          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=1 attempt=1"
+          echo "STEP0 versions python=$(python3 -I -c 'import platform; print(platform.python_version())') containerd=$(containerd --version | cut -d' ' -f3) dockerd=$(dockerd --version | cut -d' ' -f3 | tr -d ,)"
+
+      # ------------------------------------------------------------------ 1. fetch (host network, before any isolation)
+      - name: 1-fetch-and-verify
+        timeout-minutes: 15
+        run: |
+          . "$RUNNER_TEMP/lib.sh"
+          F="$RT/fetch"
+          led "intent pf530 kind=path target=$F"; mkdir "$F" || stop "STOP1 fetch_dir_exists"; led "path $F ino=$(stat -c %i "$F")"
+          cd "$F"
+          curl -fsSL --retry 3 -o cli.tar.gz "$CLI_URL" || stop "STOP1 cli_download"
+          echo "$CLI_SHA256  cli.tar.gz" | sha256sum -c --status - || stop "STOP1 cli_sha256_mismatch"
+          members="$(tar -tzf cli.tar.gz)" || stop "STOP1 cli_archive_unreadable"
+          [ "$members" = "supabase" ] || stop "STOP1 cli_archive_members"
+          tar -xzf cli.tar.gz supabase || stop "STOP1 cli_extract"
+          [ ! -e /usr/local/bin/supabase-pf ] || stop "STOP1 cli_target_exists"
+          led "intent pf530 kind=path target=/usr/local/bin/supabase-pf"
+          sudo install -o root -g root -m 0755 supabase /usr/local/bin/supabase-pf || stop "STOP1 cli_install"
+          led "path /usr/local/bin/supabase-pf ino=$(stat -c %i /usr/local/bin/supabase-pf)"
+          v="$(env -i PATH=/usr/bin:/bin HOME="$F" DO_NOT_TRACK=1 SUPABASE_TELEMETRY_DISABLED=1 /usr/local/bin/supabase-pf --version)" || stop "STOP1 cli_version_query"
+          [ "$v" = "$CLI_VERSION" ] || stop "STOP1 cli_version_mismatch"
+          echo "STEP1 cli sha256=verified members=supabase version=$v"
+          mkdir "$F/img"
+          set +e; python3 -I "$RT/regfetch.py" "$IMAGE_NAME" "$IMAGE_INDEX" "$IMAGE_AMD64" "$F/img" "$IMAGE_NAME:$PG_PIN"; rc=$?; set -e
+          case "$rc" in 0) ;; 3) stop "STOP1 image_identity_mismatch" ;; *) stop "STOP1 image_fetch_tool_error rc=$rc" ;; esac
+
+      # ------------------------------------------------------------------ 2. boundary + dedicated engine, verified before any database
+      - name: 2-isolate
+        timeout-minutes: 8
+        run: |
+          . "$RUNNER_TEMP/lib.sh"
+          # 2a. nothing of this run may pre-exist
+          if getent passwd "$TU" >/dev/null || getent group "$TU" >/dev/null; then stop "STOP2 test_user_or_group_exists"; fi
+          [ ! -e "/run/netns/$NS" ] || stop "STOP2 netns_exists"
+          for p in "$R" "$RR" "$EN"; do [ ! -e "$p" ] || stop "STOP2 path_exists $p"; done
+          # 2b. test user: own group only, no docker group, no login
+          led "intent pf530 kind=user target=$TU"
+          sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$TU" || stop "STOP2 useradd"
+          id -u "$TU" > "$RT/uid"; id -g "$TU" > "$RT/gid"
+          led "user $TU uid=$(cat "$RT/uid") gid=$(cat "$RT/gid")"
+          [ "$(id -G "$TU")" = "$(cat "$RT/gid")" ] || stop "STOP2 test_user_groups"
+          # 2c. run-owned paths, each recorded with its inode
+          if [ ! -d /etc/netns ]; then mkown /etc/netns 0755; fi
+          mkown "$R" 0711; mkown "$RR" 0711; mkown "$EN" 0755
+          printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:1\n' | sudo tee "$EN/resolv.conf" >/dev/null
+          # name service without the host resolver socket: files, then the (unreachable) DNS above
+          printf 'passwd: files\ngroup: files\nshadow: files\nhosts: files dns\nnetworks: files\nprotocols: files\nservices: files\n' | sudo tee "$EN/nsswitch.conf" >/dev/null
+          sudo mkdir -m 0700 "$R/containerd" "$R/docker" "$R/logs" "$RR/containerd"
+          sudo mkdir -m 0711 "$R/work"
+          sudo mkdir -m 0700 "$R/home" "$W"
+          sudo chown "$(cat "$RT/uid"):$(cat "$RT/gid")" "$R/home" "$W"
+          # 2d. network namespace with loopback only
+          led "intent pf530 kind=netns target=$NS"
+          sudo ip netns add "$NS" || stop "STOP2 netns_add"
+          sudo stat -L -c %i "/run/netns/$NS" > "$RT/ns_ino"
+          led "netns $NS ino=$(cat "$RT/ns_ino")"
+          sudo ip -n "$NS" link set lo up || stop "STOP2 lo_up"
+          echo "STEP2 step_shell_netns=$(readlink /proc/self/ns/net) test_netns=net:[$(cat "$RT/ns_ino")]"
+          python3 -I "$RT/probe.py" host || true
+          probe pre_engine STOP2
+          # 2e. one launcher process starts both engines inside the namespace (one mount namespace for both)
+          printf 'version = 2\ndisabled_plugins = ["io.containerd.grpc.v1.cri"]\n' | sudo tee "$R/containerd.toml" >/dev/null
+          sudo tee "$R/daemon.json" >/dev/null <<'JSON'
+          {"data-root": "/var/lib/pf530/docker", "exec-root": "/run/pf530/docker-exec", "pidfile": "/run/pf530/dockerd.pid",
+           "hosts": ["unix:///run/pf530/docker.sock"], "group": "pf530", "containerd": "/run/pf530/containerd/containerd.sock",
+           "containerd-namespace": "pf530", "containerd-plugins-namespace": "pf530-plugins",
+           "storage-driver": "overlay2", "features": {"containerd-snapshotter": false},
+           "dns": ["127.0.0.1"], "ipv6": false, "live-restore": false}
+          JSON
+          sudo sh -c 'ip netns exec "$1" sh "$2" "$3" "$4" </dev/null >/dev/null 2>&1 & echo $! > "$4/launcher.spawn.pid"' sh "$NS" "$RT/engines.sh" "$R" "$RR"
+          for i in $(seq 90); do dk version >/dev/null 2>&1 && break; sleep 1; done
+          dk version >/dev/null 2>&1 || stop "STOP2 dedicated_engine_not_ready"
+          mnt=""
+          for n in launcher containerd dockerd; do
+            pid="$(sudo cat "$RR/$n.spawn.pid")" || stop "STOP2 engine_pid_missing $n"
+            net="$(sudo readlink "/proc/$pid/ns/net")" || stop "STOP2 engine_process_gone $n"
+            m="$(sudo readlink "/proc/$pid/ns/mnt")" || stop "STOP2 engine_process_gone $n"
+            [ "$net" = "net:[$(cat "$RT/ns_ino")]" ] || stop "STOP2 engine_outside_test_netns $n"
+            [ -z "$mnt" ] || [ "$m" = "$mnt" ] || stop "STOP2 engines_in_different_mount_namespaces"
+            mnt="$m"; echo "STEP2 $n pid=$pid netns=$net mntns=$m"
+          done
+          led "engine pf530 launcher=$(sudo cat "$RR/launcher.spawn.pid") containerd=$(sudo cat "$RR/containerd.spawn.pid") dockerd=$(sudo cat "$RR/dockerd.spawn.pid") mnt=$mnt"
+          echo "STEP2 step_shell_mntns=$(readlink /proc/self/ns/mnt)"
+          info="$(dk info --format '{{.DockerRootDir}}|{{.Driver}}|{{.Containers}}|{{.Images}}')" || stop "STOP2 engine_query"
+          [ "$info" = "/var/lib/pf530/docker|overlay2|0|0" ] || stop "STOP2 dedicated_engine_state $info"
+          vols="$(dk volume ls -q)" || stop "STOP2 engine_query"
+          [ -z "$vols" ] || stop "STOP2 dedicated_engine_not_empty"
+          nets="$(dk network ls --format '{{.Name}}' | sort | tr '\n' ' ')" || stop "STOP2 engine_query"
+          [ "$nets" = "bridge host none " ] || stop "STOP2 dedicated_engine_networks"
+          # 2f. the test user reaches the dedicated engine and cannot reach the host engine sockets
+          set +e; as_user python3 -I - sockets "$SOCKP" "$(cat "$RT/ns_ino")" < "$RT/probe.py"; rc=$?; set -e
+          case "$rc" in 0) ;; 3) stop "STOP2 socket_access_not_as_declared" ;; *) stop "STOP2 socket_probe_tool_error rc=$rc" ;; esac
+          # 2g. load the verified image (no network involved)
+          loaded="$(dk load -i "$RT/fetch/img/image.tar")" || stop "STOP2 image_load"
+          echo "STEP2 $loaded"
+          exp="$(cat "$RT/fetch/img/expected_image_id")"
+          got="$(dk image inspect --format '{{.Id}}' "$IMAGE_NAME:$PG_PIN")" || stop "STOP2 image_inspect"
+          [ "$got" = "$exp" ] || stop "STOP2 loaded_image_id_mismatch"
+          cnt="$(dk image ls -q --no-trunc | sort -u | wc -l)" || stop "STOP2 engine_query"
+          [ "$cnt" = "1" ] || stop "STOP2 unexpected_image_count $cnt"
+          echo "STEP2 loaded_image_id=$got (equals the verified config digest)"
+          # 2h. the project network the CLI will reuse (it creates one only if absent), bound to loopback by its own option
+          nid="$(dk network create --driver bridge -o com.docker.network.bridge.host_binding_ipv4=127.0.0.1 \
+            --label "com.supabase.cli.project=$PROJ" --label "com.docker.compose.project=$PROJ" "$NET")" || stop "STOP2 network_create"
+          led "network pf530 id=$nid"
+          ncfg="$(dk network inspect --format '{{.Name}}|{{.Driver}}|{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}|{{.Internal}}' "$nid")" || stop "STOP2 network_inspect"
+          echo "STEP2 network id=$nid config=$ncfg"
+          [ "$ncfg" = "$NET|bridge|127.0.0.1|false" ] || stop "STOP2 network_not_as_declared"
+          probe post_engine STOP2
+
+      # ------------------------------------------------------------------ 3. official init + declared configuration
+      - name: 3-configure
+        timeout-minutes: 3
+        run: |
+          . "$RUNNER_TEMP/lib.sh"
+          : > "$RT/init.log" || stop "STOP3 evidence_unwritable"
+          set +e; as_user sh -c 'cd "$1" && exec supabase-pf init' sh "$W" >> "$RT/init.log" 2>&1; rc=$?; set -e
+          if [ "$rc" != "0" ]; then python3 -I "$RT/diag.py" log "$RT/init.log" init || true; stop "STOP3 init_failed rc=$rc"; fi
+          set +e; sudo python3 -I "$RT/cfg.py" patch "$W" "$PROJ"; rc=$?; set -e
+          case "$rc" in 0) ;; 3) stop "STOP3 config_not_as_declared" ;; *) stop "STOP3 config_tool_error rc=$rc" ;; esac
+          as_user sh -c 'mkdir -p "$1/supabase/.temp" && printf "%s\n" "$2" > "$1/supabase/.temp/postgres-version"' sh "$W" "$PG_PIN" || stop "STOP3 version_pin_write"
+          set +e; sudo env PG_PIN="$PG_PIN" python3 -I "$RT/cfg.py" inputs "$W" "$PROJ"; rc=$?; set -e
+          case "$rc" in 0) ;; 3) stop "STOP3 inputs_not_empty" ;; *) stop "STOP3 inputs_tool_error rc=$rc" ;; esac
+
+      # ------------------------------------------------------------------ 4. official entry point
+      - name: 4-db-start
+        timeout-minutes: 12
+        run: |
+          . "$RUNNER_TEMP/lib.sh"
+          LOG="$RT/db_start.log"
+          : > "$LOG" || stop "STOP4 evidence_unwritable"
+          exp_ns="net:[$(cat "$RT/ns_ino")]"
+          # the guard runs inside the same call, before the official tool: it writes its evidence to the log channel
+          # opened by this step and refuses to start on a read error, a write error or a different namespace
+          set +e
+          as_user sh -c 'g="$(readlink /proc/self/ns/net)" || { echo "PF_GUARD read_error" || true; exit 97; }
+            echo "PF_GUARD netns=$g" || exit 95
+            [ "$g" = "$2" ] || { echo "PF_GUARD mismatch" || true; exit 98; }
+            cd "$1" || { echo "PF_GUARD workdir_error" || true; exit 96; }
+            echo "PF_GUARD start" || exit 95
+            exec timeout 600 supabase-pf db start' sh "$W" "$exp_ns" >> "$LOG" 2>&1
+          rc=$?
+          set -e
+          [ -f "$LOG" ] || stop "STOP4 evidence_missing"
+          l1="$(sed -n 1p "$LOG")"; l2="$(sed -n 2p "$LOG")"
+          case "$l1" in "PF_GUARD "*) ;; *) l1="PF_GUARD absent" ;; esac
+          case "$l2" in "PF_GUARD "*) ;; *) l2="PF_GUARD absent" ;; esac
+          echo "STEP4 guard ${l1#PF_GUARD } / ${l2#PF_GUARD } exit=$rc"
+          # A missing or misplaced start marker cannot prove whether an attempt began.
+          [ "$l2" = "PF_GUARD start" ] || stop "STOP4 start_not_confirmed guard=${l2#PF_GUARD } rc=$rc"
+          [ "$l1" = "PF_GUARD netns=$exp_ns" ] || stop "STOP4 started_guard_evidence_inconsistent"
+          # started: from here on a nonzero exit is a failure of the started attempt
+          python3 -I "$RT/diag.py" log "$LOG" db_start || stop "STOP4 diag_tool_error"
+          if [ "$rc" != "0" ]; then
+            dk ps -a --format 'STEP4 container name={{.Names}} state={{.State}}' || true
+            [ "$rc" = "124" ] && stop "STOP4 db_start_timeout"
+            stop "STOP4 db_start_failed rc=$rc"
+          fi
+          set +e; python3 -I "$RT/diag.py" activity "$LOG"; rc=$?; set -e
+          case "$rc" in 0) ;; 3) stop "STOP4 migration_or_seed_activity" ;; *) stop "STOP4 activity_tool_error rc=$rc" ;; esac
+
+      # ------------------------------------------------------------------ 5. identity + read-only measurement
+      - name: 5-measure
+        timeout-minutes: 4
+        run: |
+          . "$RUNNER_TEMP/lib.sh"
+          exp="$(cat "$RT/fetch/img/expected_image_id")"
+          nid="$(awk '$1 == "network" {sub(/^id=/, "", $3); print $3}' "$LEDGER")"
+          all="$(dk ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Image}}')" || stop "STOP5 engine_query"
+          echo "STEP5 containers_in_dedicated_engine:"; printf '%s\n' "$all"
+          ids="$(printf '%s\n' "$all" | awk -v n="supabase_db_$PROJ" '$2 == n {print $1}')"
+          set -- $ids
+          [ "$#" = "1" ] || stop "STOP5 db_container_not_unique count=$#"
+          CID="$1"; led "container pf530 id=$CID"
+          meta="$(dk inspect --format '{{.Name}}|{{.Image}}|{{index .Config.Labels "com.supabase.cli.project"}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.Privileged}}|{{.HostConfig.PidMode}}' "$CID")" || stop "STOP5 inspect"
+          echo "STEP5 db_container id=$CID meta=$meta"
+          [ "$meta" = "/supabase_db_$PROJ|$exp|$PROJ|true|$NET|false|" ] || stop "STOP5 db_container_identity"
+          attached="$(dk inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}} {{end}}' "$CID")" || stop "STOP5 inspect"
+          [ "$attached" = "$NET=$nid " ] || stop "STOP5 db_container_not_on_run_network"
+          ncfg="$(dk network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$nid")" || stop "STOP5 network_inspect"
+          [ "$ncfg" = "127.0.0.1" ] || stop "STOP5 network_binding_changed"
+          ports="$(dk inspect --format '{{json .NetworkSettings.Ports}}' "$CID")" || stop "STOP5 inspect"
+          python3 -I -c 'import json,sys; p=json.loads(sys.argv[1]) or {}; b=[x for v in p.values() for x in (v or [])]; print("STEP5 published", b); sys.exit(0 if b and all(x.get("HostIp")=="127.0.0.1" for x in b) else 3)' "$ports" || stop "STOP5 published_port_not_loopback_only"
+          host_l="$(ss -ltnH)" || stop "STOP5 ss_host"
+          ns_l="$(in_ns ss -ltnH)" || stop "STOP5 ss_test_netns"
+          case "$host_l" in *":54322 "*) stop "STOP5 db_port_listening_in_host_namespace" ;; esac
+          case "$ns_l" in *"127.0.0.1:54322 "*) ;; *) stop "STOP5 db_port_not_on_test_loopback" ;; esac
+          echo "STEP5 db_port host_namespace=absent test_namespace=127.0.0.1:54322"
+          probe post_start STOP5
+          M="$RT/measure.txt"
+          : > "$M" || stop "STOP5 evidence_unwritable"
+          set +e
+          dk exec -i -e PGPASSWORD=postgres "$CID" psql -h 127.0.0.1 -U postgres -d postgres -X -q -At -F ' | ' -v ON_ERROR_STOP=1 -v VERBOSITY=sqlstate < "$RT/measure.sql" >> "$M" 2> "$RT/measure.err"
+          rc=$?
+          set -e
+          if [ "$rc" != "0" ]; then python3 -I "$RT/diag.py" psql "$RT/measure.err" || true; stop "STOP5 measurement_query_failed rc=$rc"; fi
+          set +e; python3 -I "$RT/compare.py" "$M"; rc=$?; set -e
+          case "$rc" in 0) ;; 5) stop "STOP5 evidence_incomplete_or_invalid" ;; *) stop "STOP5 compare_tool_error rc=$rc" ;; esac
+
+      # ------------------------------------------------------------------ 6. cleanup of ledger-proven resources only (always)
+      - name: 6-cleanup
+        if: always()
+        timeout-minutes: 8
+        run: |
+          if [ ! -f "$RUNNER_TEMP/cleanup.py" ]; then echo "STEP6 helpers_absent no_resources_created"; exit 0; fi
+          sudo python3 -I "$RUNNER_TEMP/cleanup.py" "$RUNNER_TEMP/ledger" "$RUNNER_TEMP"
