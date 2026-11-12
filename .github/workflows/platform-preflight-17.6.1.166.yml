@@ -390,13 +390,15 @@ jobs:
               SETUP = ("ok", "no_invocation_id", "claim_unwritable", "not_authorized", "authorization_mismatch", "mount_failed",
                        "init_mkdir_failed", "move_failed", "enable_failed", "self_unreadable", "view_unreadable")
               OWNERSHIP = ("owned", "launcher_claim_absent", "launcher_claim_invalid", "launcher_pid_mismatch", "identity_unreadable",
-                           "unit_not_active", "unit_path_unexpected", "identity_mismatch_unit", "cgroup_identity_missing",
-                           "identity_mismatch_cgroup", "launcher_gone", "launcher_not_at_scope_root")
+                           "unit_not_active", "unit_path_unexpected", "identity_mismatch_unit", "cgroup_path_absent",
+                           "cgroup_path_unreadable", "cgroup_path_transition", "cgroup_path_malformed", "cgroup_path_changed",
+                           "launcher_cgroup_unreadable", "launcher_gone", "launcher_not_at_scope_root")
+              XATTR = ("path_absent", "no_id", "match", "other_id", "unreadable")
               le = rd("launcher.err")
-              print("DIAG engine run_scope_load=%s run_scope_active=%s run_scope_ownership=%s cgroup_setup=%s cgroup_view=%s launcher_stderr_lines=%s" % (
+              print("DIAG engine run_scope_load=%s run_scope_active=%s run_scope_ownership=%s run_scope_xattr=%s cgroup_setup=%s cgroup_view=%s launcher_stderr_lines=%s" % (
                   unit("LoadState", ("loaded", "not-found", "error", "masked", "bad-setting", "merged", "stub")),
                   unit("ActiveState", ("active", "inactive", "activating", "deactivating", "failed", "reloading", "maintenance")),
-                  vocab(rd("scope.verdict"), OWNERSHIP), vocab(rd("cgroup.setup"), SETUP), view(rd("cgroup.view")),
+                  vocab(rd("scope.verdict"), OWNERSHIP), vocab(rd("scope.xattr"), XATTR), vocab(rd("cgroup.setup"), SETUP), view(rd("cgroup.view")),
                   "not_recorded" if le is None else len([l for l in le.splitlines() if l.strip()])))
               # untagged startup errors written by dockerd's onError (cmd/dockerd/docker.go) and their wrappers (cmd/dockerd/daemon.go)
               UNTAGGED = [("failed to start daemon, ensure docker is not running", "pidfile_in_use"), ("failed to create pidfile directory", "pidfile"),
@@ -473,13 +475,19 @@ jobs:
           SQL
 
           cat > "$RT/own.py" <<'PY'
-          # Run scope ownership. Pure decision functions (no system access) and one observer; cleanup.py imports this file.
-          # A scope is this run's only when three independent records name the same invocation: the ID systemd-run handed to
-          # the launcher it started, the unit's InvocationID property, and the trusted.invocation_id xattr of the cgroup at the
-          # only accepted path; and the kernel shows the launcher at that cgroup before anything in the tree has changed.
+          # Run scope ownership. Pure decision functions (no system access) and observers; cleanup.py imports this file.
+          # The scope is this run's only when: the invocation ID systemd-run handed to the launcher it started (INVOCATION_ID,
+          # systemd.exec(5): the same ID is passed to all processes of the unit) equals the unit's InvocationID property; the
+          # unit's ControlGroup is the only accepted path; the kernel shows the launcher at that path (/proc/PID/cgroup); and
+          # the cgroup directory's identity (inode) is the same before and after that membership read. A cgroup with a live
+          # process cannot be removed (cgroup-v2: only a cgroup without children or live processes can be removed), so the
+          # recorded inode is the directory that holds this launcher. The trusted.invocation_id xattr is reported only: systemd
+          # v255 realizes a scope's cgroup before it acquires the invocation ID, so the xattr is not guaranteed for scopes.
           import os, re, subprocess, sys
           UNIT = "pf530.scope"; EXP_CG = "/system.slice/pf530.scope"
-          HEX = re.compile(r"[0-9a-f]{32}")
+          HEX = re.compile(r"[0-9a-f]{32}"); NUM = re.compile(r"[1-9][0-9]{0,19}")
+          def ino_ok(v):  # an inode as text: no sign, no leading zero, 1 .. 2**64-1
+              return v is not None and bool(NUM.fullmatch(v)) and int(v) <= 2 ** 64 - 1
           LOADS = ("loaded", "not-found", "error", "masked", "bad-setting", "merged", "stub")
           ACTIVES = ("active", "inactive", "activating", "deactivating", "failed", "reloading", "maintenance")
           def prop(unit, name):  # the value, or None when it cannot be read
@@ -488,86 +496,130 @@ jobs:
               except (OSError, subprocess.SubprocessError):
                   return None
               return r.stdout.strip() if r.returncode == 0 else None
-          def xattr(path):  # 'absent' (no cgroup there), 'none' (cgroup without an ID), the ID, or None when unreadable
+          def cg_ino(path):  # 'absent' (no directory: proven absence of the path), the inode as text, or None when unreadable
               try:
-                  v = os.getxattr(path, "trusted.invocation_id")
+                  st = os.stat(path)
               except FileNotFoundError:
                   return "absent"
+              except OSError:
+                  return None
+              return str(st.st_ino)
+          def xattr_state(path, inv):  # diagnostic category only: path_absent | no_id | match | other_id | unreadable
+              try:
+                  v = os.getxattr(path, "trusted.invocation_id").decode("ascii", "replace").strip("\0")
+              except FileNotFoundError:
+                  return "path_absent"
               except OSError as e:
-                  return "none" if e.errno == 61 else None
-              return v.decode("ascii", "replace").strip("\0")
+                  return "no_id" if e.errno == 61 else "unreadable"
+              return "match" if inv and v == inv else "other_id"
           def observe(unit):
-              return prop(unit, "LoadState"), prop(unit, "ActiveState"), prop(unit, "InvocationID"), xattr("/sys/fs/cgroup" + EXP_CG)
-          def decide_start(claim, spawn_pid, load, active, p_inv, p_cg, x_inv, pid_cg):
+              return prop(unit, "LoadState"), prop(unit, "ActiveState"), prop(unit, "InvocationID"), cg_ino("/sys/fs/cgroup" + EXP_CG)
+          def decide_start(claim, spawn_pid, load, active, p_inv, p_cg, ino_before, pid_cg, ino_after):  # (code, inv, ino)
               if claim is None:
-                  return "launcher_claim_absent", None
+                  return "launcher_claim_absent", None, None
               t = claim.split()
               if len(t) != 2 or not t[0].isdigit() or not HEX.fullmatch(t[1]):
-                  return "launcher_claim_invalid", None
+                  return "launcher_claim_invalid", None, None
               if spawn_pid is None or t[0] != spawn_pid:
-                  return "launcher_pid_mismatch", None
-              if None in (load, active, p_inv, p_cg, x_inv, pid_cg):
-                  return "identity_unreadable", None
+                  return "launcher_pid_mismatch", None, None
+              if None in (load, active, p_inv, p_cg):
+                  return "identity_unreadable", None, None
               if load != "loaded" or active != "active":
-                  return "unit_not_active", None
+                  return "unit_not_active", None, None
               if p_cg != EXP_CG:
-                  return "unit_path_unexpected", None
+                  return "unit_path_unexpected", None, None
               if p_inv != t[1]:
-                  return "identity_mismatch_unit", None
-              if x_inv in ("absent", "none"):
-                  return "cgroup_identity_missing", None
-              if x_inv != t[1]:
-                  return "identity_mismatch_cgroup", None
+                  return "identity_mismatch_unit", None, None
+              # the pair of path samples (before and after the membership read), classified apart; none of them grants ownership:
+              # a sample could not be taken / absent in both / present in one and absent in the other / not an inode / two inodes
+              if ino_before is None or ino_after is None:
+                  return "cgroup_path_unreadable", None, None
+              if ino_before == "absent" and ino_after == "absent":
+                  return "cgroup_path_absent", None, None
+              if ino_before == "absent" or ino_after == "absent":
+                  return "cgroup_path_transition", None, None
+              if not ino_ok(ino_before) or not ino_ok(ino_after):
+                  return "cgroup_path_malformed", None, None
+              if ino_before != ino_after:
+                  return "cgroup_path_changed", None, None
+              if pid_cg is None:
+                  return "launcher_cgroup_unreadable", None, None
               if pid_cg == "absent":
-                  return "launcher_gone", None
+                  return "launcher_gone", None, None
               if pid_cg != "0::%s\n" % EXP_CG:
-                  return "launcher_not_at_scope_root", None
-              return "owned", t[1]
-          def wellformed(load, active, p_inv, x_inv):  # every observed value from its known form, or the observation is not used
+                  return "launcher_not_at_scope_root", None, None
+              return "owned", t[1], ino_before
+          def wellformed(load, active, p_inv, ino):  # every observed value from its known form, or the observation is not used
               if load == "not-found" and (active != "inactive" or p_inv not in ("", "0" * 32)):
                   return False
               return load in LOADS and active in ACTIVES and (p_inv == "" or bool(HEX.fullmatch(p_inv))) and \
-                  (x_inv in ("absent", "none") or bool(HEX.fullmatch(x_inv)))
-          def gone(rec_inv, load, active, p_inv, x_inv):
-              # positive evidence that the run's scope no longer exists: no cgroup at the only accepted path, and either no unit
-              # under the name or only our own invocation, ended. A cgroup still present (with any or no ID) is never "gone",
-              # and a process count of zero is not evidence that a remaining empty cgroup has been removed.
-              return x_inv == "absent" and (load == "not-found" or (p_inv == rec_inv and active in ("inactive", "failed")))
-          def decide_cleanup(rec_inv, load, active, p_inv, x_inv):  # (action, state); action is 'stop' only for a proven scope
-              if rec_inv is None or not HEX.fullmatch(rec_inv):
+                  (ino == "absent" or ino_ok(ino))
+          def record_ok(rec_inv, rec_ino):  # the field rule shared by the record file, the ledger and cleanup
+              return rec_inv is not None and bool(HEX.fullmatch(rec_inv)) and ino_ok(rec_ino)
+          def format_record(inv, ino):  # writer: the only form of scope.verified
+              s = "%s %s\n" % (inv, ino)
+              if parse_record(s) is None:
+                  raise ValueError("ownership record not in its form")
+              return s
+          def parse_record(text):  # reader: exactly "<32 lowercase hex> <inode>" and one final LF, else None
+              if text is None or not text.endswith("\n") or text.count("\n") != 1:
+                  return None
+              f = text[:-1].split(" ")
+              if len(f) != 2 or not record_ok(f[0], f[1]):
+                  return None
+              return f[0], f[1]
+          def gone(rec_inv, load, active, p_inv, ino):
+              # positive evidence that the run's scope no longer exists: no directory at the only accepted path, and either no unit
+              # under the name or only our own invocation, ended. A directory still present is never "gone", and a process
+              # count of zero is not evidence that a remaining empty cgroup has been removed.
+              return ino == "absent" and (load == "not-found" or (p_inv == rec_inv and active in ("inactive", "failed")))
+          def decide_cleanup(rec_inv, rec_ino, load, active, p_inv, ino):  # (action, state); 'stop' only for a proven scope
+              if not record_ok(rec_inv, rec_ino):
                   return "none", "record_invalid"
-              if None in (load, active, p_inv, x_inv):
+              if None in (load, active, p_inv, ino):
                   return "none", "unreadable"
-              if not wellformed(load, active, p_inv, x_inv):
+              if not wellformed(load, active, p_inv, ino):
                   return "none", "malformed"
-              if gone(rec_inv, load, active, p_inv, x_inv):
+              if gone(rec_inv, load, active, p_inv, ino):
                   return "none", "absent"
-              if p_inv == rec_inv and x_inv == rec_inv:
+              if p_inv == rec_inv and ino == rec_ino:
                   return "stop", "owned"
               return "none", "identity_mismatch"
-          def verify_scope(rec_inv, load, active, p_inv, x_inv):  # (verified, state): verified only on positive evidence
-              if None in (load, active, p_inv, x_inv):
+          def verify_scope(rec_inv, rec_ino, load, active, p_inv, ino):  # (verified, state): verified only on positive evidence
+              if None in (load, active, p_inv, ino):
                   return False, "unverifiable"
-              if rec_inv is None or not HEX.fullmatch(rec_inv):
+              if not record_ok(rec_inv, rec_ino):
                   return False, "record_invalid"
-              if not wellformed(load, active, p_inv, x_inv):
+              if not wellformed(load, active, p_inv, ino):
                   return False, "malformed"
-              if gone(rec_inv, load, active, p_inv, x_inv):
+              if gone(rec_inv, load, active, p_inv, ino):
                   return True, "absent"
-              if x_inv == rec_inv or (p_inv == rec_inv and active not in ("inactive", "failed")):
+              if ino == rec_ino or (p_inv == rec_inv and active not in ("inactive", "failed")):
                   return False, "present"
-              # anything else (cgroup left without an ID, unit and cgroup naming other or different IDs, a replacement that may
-              # or may not be someone else's) is not resolved here and stays unverified
+              # anything else (a directory at the path with another identity, a unit naming another invocation) stays unverified
               return False, "unresolved_identity"
-          def verify_unproven(load, active, p_inv, x_inv):  # an intent without a proven identity: never acted on
-              if None in (load, active, p_inv, x_inv):
+          def verify_unproven(load, active, p_inv, ino):  # an intent without a proven identity: never acted on
+              if None in (load, active, p_inv, ino):
                   return False, "unverifiable"
-              if not wellformed(load, active, p_inv, x_inv):
+              if not wellformed(load, active, p_inv, ino):
                   return False, "malformed"
-              if load == "not-found" and x_inv == "absent":
+              if load == "not-found" and ino == "absent":
                   return True, "absent"
               return False, "present_identity_unproven"
-          if __name__ == "__main__":
+          if __name__ == "__main__" and (len(sys.argv) != 3 or sys.argv[1] not in ("start", "record")):
+              sys.exit(2)
+          if __name__ == "__main__" and sys.argv[1] == "record":
+              # exit 0 with "<inv> <ino>" on stdout, 3 when the record is not in its form, 4 when it cannot be read
+              try:
+                  text = open(os.path.join(sys.argv[2], "scope.verified"), encoding="ascii", newline="").read()  # no newline translation
+              except (OSError, UnicodeDecodeError) as e:
+                  sys.exit(3 if isinstance(e, UnicodeDecodeError) else 4)
+              rec = parse_record(text)
+              if rec is None:
+                  sys.exit(3)
+              print("%s %s" % rec)
+              sys.exit(0)
+          if __name__ == "__main__" and sys.argv[1] == "start":
               rr = sys.argv[2]
               def rd(n):
                   try:
@@ -575,7 +627,11 @@ jobs:
                   except FileNotFoundError:
                       return None
               claim, sp = rd("launcher.claim"), rd("launcher.spawn.pid")
-              pid = claim.split()[0] if claim and claim.split() and claim.split()[0].isdigit() else None
+              t = claim.split() if claim else []
+              pid = t[0] if t and t[0].isdigit() else None
+              load, active, p_inv = prop(UNIT, "LoadState"), prop(UNIT, "ActiveState"), prop(UNIT, "InvocationID")
+              path = "/sys/fs/cgroup" + EXP_CG
+              ino_before = cg_ino(path)
               pid_cg = None
               if pid:
                   try:
@@ -584,14 +640,16 @@ jobs:
                       pid_cg = "absent"
                   except OSError:
                       pid_cg = None
-              load, active, p_inv, x_inv = observe(UNIT)
-              code, inv = decide_start(claim, sp, load, active, p_inv, prop(UNIT, "ControlGroup"), x_inv, pid_cg)
+              ino_after = cg_ino(path)
+              code, inv, ino = decide_start(claim, sp, load, active, p_inv, prop(UNIT, "ControlGroup"), ino_before, pid_cg, ino_after)
+              xs = xattr_state(path, t[1] if len(t) == 2 else None)
               open(os.path.join(rr, "scope.verdict"), "w").write(code + "\n")
-              print("STEP2 run_scope ownership=%s" % code)
+              open(os.path.join(rr, "scope.xattr"), "w").write(xs + "\n")
+              print("STEP2 run_scope ownership=%s invocation_xattr=%s (reported only)" % (code, xs))
               if code != "owned":
                   sys.exit(3)
-              open(os.path.join(rr, "scope.verified"), "w").write(inv + "\n")
-              print("STEP2 run_scope unit=%s path=%s invocation_sources=launcher,unit,cgroup_xattr agree=yes launcher_at_scope_root=yes" % (UNIT, EXP_CG))
+              open(os.path.join(rr, "scope.verified"), "w").write(format_record(inv, ino))
+              print("STEP2 run_scope unit=%s path=%s invocation_sources=launcher,unit agree=yes launcher_at_scope_root=yes cgroup_identity=stable" % (UNIT, EXP_CG))
           PY
 
           cat > "$RT/compare.py" <<'PY'
@@ -759,7 +817,7 @@ jobs:
           #     (engines, shims, containers) and systemd then removes the subtree. Any other state: no action.
           #     systemctl stops by name only: the identity read just before the stop cannot be bound to the stop request itself.
           for _, u, d in rec("scope"):
-              act, state = own.decide_cleanup(d.get("inv"), *own.observe(u))
+              act, state = own.decide_cleanup(d.get("inv"), d.get("ino"), *own.observe(u))
               if act == "stop":
                   run("scope_stop_" + u, ["systemctl", "stop", u])
               else:
@@ -826,7 +884,7 @@ jobs:
                   present = n in [p.pw_name for p in pwd.getpwall()] or n in [g.gr_name for g in grp.getgrall()]
                   note("user_and_group:" + n, not present, "present" if present else "absent")
               elif k == "scope":
-                  ok, state = own.verify_scope(d.get("inv"), *own.observe(n))
+                  ok, state = own.verify_scope(d.get("inv"), d.get("ino"), *own.observe(n))
                   note("scope:" + n, ok, state)
           nsi = [d.get("ino") for k, _, d in ent if k == "netns"]
           cids = [d.get("id") for k, _, d in ent if k == "container"]
@@ -857,11 +915,11 @@ jobs:
           for f in lib.sh regfetch.py probe.py engines.sh cfg.py diag.py own.py measure.sql compare.py cleanup.py; do
             echo "STEP0 helper $f sha256=$(sha256sum "$RT/$f" | cut -c1-64)"
           done
-          # runs 1 and 2 of this workflow file consumed the first two authorizations; only run number 3, attempt 1 is accepted here.
-          # Any other dispatch (4, 5, ...) or any re-run attempt (3/2, ...) stops before any fetch or creation.
+          # runs 1, 2 and 3 of this workflow file consumed the first three authorizations; only run number 4, attempt 1 is accepted here.
+          # Any other dispatch (5, 6, ...) or any re-run attempt (4/2, ...) stops before any fetch or creation.
           case "$GITHUB_RUN_NUMBER" in ''|*[!0-9]*) rn=invalid ;; *) rn="$GITHUB_RUN_NUMBER" ;; esac
           case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) ra=invalid ;; *) ra="$GITHUB_RUN_ATTEMPT" ;; esac
-          [ "$rn" = "3" ] && [ "$ra" = "1" ] || stop "STOP0 not_the_authorized_run run_number=$rn run_attempt=$ra accepted_only=3/1"
+          [ "$rn" = "4" ] && [ "$ra" = "1" ] || stop "STOP0 not_the_authorized_run run_number=$rn run_attempt=$ra accepted_only=4/1"
           [ "$RUNNER_OS" = "Linux" ] && [ "$RUNNER_ARCH" = "X64" ] || stop "STOP0 unexpected_runner"
           # no checkout: the workspace must be empty
           [ -z "$(ls -A "$GITHUB_WORKSPACE")" ] || stop "STOP0 workspace_not_empty"
@@ -869,7 +927,7 @@ jobs:
             sudo sh -c 'command -v "$1"' sh "$t" >/dev/null || stop "STOP0 tool_missing $t"
           done
           python3 -I -c 'import tomllib' || stop "STOP0 python_without_tomllib"
-          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=$rn run_attempt=$ra accepted_only=3/1"
+          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=$rn run_attempt=$ra accepted_only=4/1"
           echo "STEP0 versions python=$(python3 -I -c 'import platform; print(platform.python_version())') containerd=$(containerd --version | cut -d' ' -f3) dockerd=$(dockerd --version | cut -d' ' -f3 | tr -d ,) systemd=$(systemctl --version | sed -n '1s/^systemd \([0-9]*\).*/\1/p') kernel=$(uname -r)"
 
       # ------------------------------------------------------------------ 1. fetch (host network, before any isolation)
@@ -958,8 +1016,11 @@ jobs:
             [ "$orc" = "3" ] && stop "STOP2 run_scope_not_owned"
             stop "STOP2 ownership_tool_error rc=$orc"
           fi
-          inv="$(sudo cat "$RR/scope.verified")" || stop "STOP2 ownership_record_unreadable"
-          led "scope $UNIT cg=$CGP inv=$inv"
+          # the record is accepted only through own.py parse_record, the rule cleanup applies to the same two fields
+          set +e; ver="$(sudo python3 -I "$RT/own.py" record "$RR")"; vrc=$?; set -e
+          case "$vrc" in 0) ;; 3) stop "STOP2 ownership_record_invalid" ;; 4) stop "STOP2 ownership_record_unreadable" ;; *) stop "STOP2 ownership_tool_error rc=$vrc" ;; esac
+          inv="${ver% *}"; sino="${ver#* }"
+          led "scope $UNIT cg=$CGP inv=$inv ino=$sino"
           sudo sh -c 'printf "%s\n" "$1" > "$2/cgroup.go.tmp" && mv "$2/cgroup.go.tmp" "$2/cgroup.go"' sh "$inv" "$RR" || stop "STOP2 authorization_unwritable"
           for i in $(seq 90); do dk version >/dev/null 2>&1 && break; sleep 1; done
           # the decisive check is unchanged in effect; its status and stderr class are kept in memory only
