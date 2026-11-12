@@ -212,12 +212,16 @@ jobs:
           cat > "$RT/engines.sh" <<'SH'
           # One process starts containerd and dockerd as its children: both share one network and one mount namespace.
           R="$1"; RR="$2"
-          containerd --config "$R/containerd.toml" --root "$R/containerd" --state "$RR/containerd" --address "$RR/containerd/containerd.sock" >"$R/logs/containerd.log" 2>&1 &
-          echo $! > "$RR/containerd.spawn.pid"
+          # Facts for the not-ready diagnosis, all inside the run-owned /run/pf530: cgroup filesystem type seen here,
+          # the socket wait, and each daemon's wait status recorded by its own wrapper (independent of the other).
+          stat -f -c %T /sys/fs/cgroup > "$RR/cgroupfs.type" 2>/dev/null || true
+          ( containerd --config "$R/containerd.toml" --root "$R/containerd" --state "$RR/containerd" --address "$RR/containerd/containerd.sock" >"$R/logs/containerd.log" 2>&1 &
+            c=$!; echo "$c" > "$RR/containerd.spawn.pid"; wait "$c"; echo "$?" > "$RR/containerd.exit" ) &
           i=0
           while [ ! -S "$RR/containerd/containerd.sock" ] && [ "$i" -lt 60 ]; do sleep 1; i=$((i + 1)); done
-          dockerd --config-file "$R/daemon.json" >"$R/logs/dockerd.log" 2>&1 &
-          echo $! > "$RR/dockerd.spawn.pid"
+          if [ -S "$RR/containerd/containerd.sock" ]; then echo "ready_after_s=$i"; else echo "not_ready_after_s=$i"; fi > "$RR/containerd.socket_wait"
+          ( dockerd --config-file "$R/daemon.json" >"$R/logs/dockerd.log" 2>&1 &
+            d=$!; echo "$d" > "$RR/dockerd.spawn.pid"; wait "$d"; echo "$?" > "$RR/dockerd.exit" ) &
           wait
           SH
 
@@ -277,7 +281,8 @@ jobs:
           # Declared diagnostic fields only; no raw log text is printed.
           import hashlib, re, sys
           mode, path = sys.argv[1], sys.argv[2]
-          data = open(path, "rb").read(); text = data.decode("utf-8", "replace"); lines = text.splitlines()
+          if mode != "engine":
+              data = open(path, "rb").read(); text = data.decode("utf-8", "replace"); lines = text.splitlines()
           PROGRESS = ["Starting database...", "Starting database from backup...", "Initialising schema...", "Seeding globals from roles.sql..."]
           ACTIVITY = {"applying_migration": "Applying migration ", "seeding_data": "Seeding data from ", "updating_seed_hash": "Updating seed hash to "}
           if mode == "log":
@@ -290,6 +295,89 @@ jobs:
               print("STEP4 %s roles_announce_line=%s (expected: printed before the roles.sql existence check)" % (
                   " ".join("%s=%d" % kv for kv in n.items()), any(l.startswith(PROGRESS[3]) for l in lines)))
               sys.exit(3 if any(n.values()) else 0)
+          elif mode == "engine":
+              # argv: engine - R RR NS_INO DECISIVE_RC DECISIVE_CLASS. Only validated, classified values are printed.
+              import os, stat as statmod
+              R, RR, NSI, RC, CLS = sys.argv[3:8]
+              def rd(name):
+                  try:
+                      return open(os.path.join(RR, name)).read().strip()
+                  except OSError:
+                      return None
+              def proc(name, exes):
+                  pid = rd(name + ".spawn.pid")
+                  if pid is None:
+                      return "pid_not_recorded"
+                  if not re.fullmatch(r"[0-9]{1,9}", pid):
+                      return "pid_invalid"
+                  if not os.path.exists("/proc/" + pid):
+                      return "not_running"
+                  try:
+                      exe = os.path.basename(os.readlink("/proc/%s/exe" % pid)); net = os.readlink("/proc/%s/ns/net" % pid)
+                  except OSError:
+                      return "unknown"
+                  # running and verified only when both the program and the test namespace match; otherwise unknown
+                  return "running_verified" if exe in exes and net == "net:[%s]" % NSI else "unknown"
+              def exit_of(name, state):
+                  v = rd(name + ".exit")
+                  if v is None:
+                      return {"running_verified": "still_running", "not_running": "not_recorded"}.get(state, "unknown")
+                  return "wait_status_" + v if re.fullmatch(r"[0-9]{1,3}", v) else "invalid"
+              def sock(p):
+                  try:
+                      mode_ = os.stat(p).st_mode
+                  except FileNotFoundError:
+                      return "absent"
+                  except OSError:
+                      return "unknown"
+                  return "socket" if statmod.S_ISSOCK(mode_) else "not_a_socket"
+              sw = rd("containerd.socket_wait")
+              sw = "not_recorded" if sw is None else (sw if re.fullmatch(r"(not_)?ready_after_s=[0-9]{1,3}", sw) else "invalid")
+              cg = rd("cgroupfs.type")
+              cg = "not_recorded" if cg is None else (cg if cg in ("cgroup2fs", "sysfs", "tmpfs", "cgroupfs") else "other")
+              st = {n: proc(n, e) for n, e in (("launcher", ("dash", "sh", "bash")), ("containerd", ("containerd",)), ("dockerd", ("dockerd",)))}
+              print("DIAG engine decisive_check_rc=%s decisive_check_class=%s" % (
+                  RC if re.fullmatch(r"[0-9]{1,3}", RC) else "invalid",
+                  CLS if CLS in ("permission_denied", "daemon_unreachable", "daemon_error_response", "empty", "other") else "invalid"))
+              print("DIAG engine launcher=%s containerd=%s dockerd=%s containerd_exit=%s dockerd_exit=%s" % (
+                  st["launcher"], st["containerd"], st["dockerd"], exit_of("containerd", st["containerd"]), exit_of("dockerd", st["dockerd"])))
+              print("DIAG engine containerd_socket=%s docker_socket=%s containerd_socket_wait=%s cgroupfs_type=%s" % (
+                  sock(os.path.join(RR, "containerd", "containerd.sock")), sock(os.path.join(RR, "docker.sock")), sw, cg))
+              # untagged startup errors written by dockerd's onError (cmd/dockerd/docker.go) and their wrappers (cmd/dockerd/daemon.go)
+              UNTAGGED = [("failed to start daemon, ensure docker is not running", "pidfile_in_use"), ("failed to create pidfile directory", "pidfile"),
+                          ("failed to load listeners", "listeners"), ("failed to start API server", "api_server"), ("failed to start daemon", "daemon_init"),
+                          ("failed to validate authorization plugin", "authz"), ("failed to start metrics server", "metrics"),
+                          ("failed to start cluster component", "cluster"), ("error initializing buildkit", "builder"), ("error creating buildkit instance", "builder"),
+                          ("failed to create builder backend", "builder"), ("failed to create sessionmanager", "builder"),
+                          ("unable to configure the Docker daemon with file", "config_file"), ("no hosts configured", "hosts"), ("bad format", "hosts"),
+                          ("error parsing tcp address", "hosts"), ("invalid TLS configuration", "tls"), ("failed to start containerd", "containerd_supervisor"),
+                          ("failed to generate containerd options", "containerd_supervisor"), ("could not determine whether the system containerd", "containerd_supervisor"),
+                          ("dockerd needs to be started with root privileges", "privileges"), ("rootless mode needs", "privileges"),
+                          ("shutting down due to ServeAPI error", "serve_api"), ("invalid DOCKER_MIN_API_VERSION", "env"), ("panic: ", "go_panic")]
+              KEYS = ["containerd", "cgroup", "iptables", "ip6tables", "network controller", "bridge", "pid file",
+                      "config", "permission denied", "address already in use", "no such file", "overlay", "snapshotter"]
+              for log in ("containerd", "dockerd"):
+                  try:
+                      t = open(os.path.join(R, "logs", log + ".log"), encoding="utf-8", errors="replace").read().splitlines()
+                  except OSError:
+                      print("DIAG %s_log not_readable" % log); continue
+                  # the level of a structured (logrus text) line is its leading field only: [time="..." ]level=WORD;
+                  # "level=" text anywhere else, e.g. inside msg, never sets the level. Other non-empty lines are untagged.
+                  def level(l):
+                      m = re.match(r'(?:time="[^"]*" )?level=([a-z]+)(?: |$)', l)
+                      return m.group(1) if m else None
+                  lv = [(l, level(l)) for l in t]
+                  tagged_bad = [l for l, v in lv if v in ("error", "fatal", "panic")]
+                  untagged = [l for l, v in lv if v is None and l.strip()]
+                  def cls(l):  # the single most specific class: the longest matching prefix at the start of the line
+                      hits = [(len(p), c) for p, c in UNTAGGED if l.startswith(p)]
+                      return max(hits)[1] if hits else None
+                  per_line = [c for c in (cls(l) for l in untagged) if c] if log == "dockerd" else []
+                  matched = [l for l in untagged if cls(l)] if log == "dockerd" else []
+                  cause_lines = [l.lower() for l in tagged_bad + matched]  # info lines never count as a cause
+                  print("DIAG %s_log lines=%d error_lines=%d fatal_lines=%d untagged_lines=%d untagged_error_classes=%s error_keywords=%s" % (
+                      log, len(t), sum(v == "error" for _, v in lv), sum(v in ("fatal", "panic") for _, v in lv), len(untagged),
+                      ",".join(sorted(set(per_line))) or "none", ",".join(k.replace(" ", "_") for k in KEYS if any(k in l for l in cause_lines)) or "none"))
           elif mode == "psql":
               hits = re.findall(r"^psql:<stdin>:(\d+): ERROR:\s+([0-9A-Z]{5})\s*$", text, re.M)
               if hits:
@@ -572,8 +660,11 @@ jobs:
           for f in lib.sh regfetch.py probe.py engines.sh cfg.py diag.py measure.sql compare.py cleanup.py; do
             echo "STEP0 helper $f sha256=$(sha256sum "$RT/$f" | cut -c1-64)"
           done
-          # once per workflow: a second dispatch or a re-run attempt stops here, before any fetch or creation
-          [ "$GITHUB_RUN_NUMBER" = "1" ] && [ "$GITHUB_RUN_ATTEMPT" = "1" ] || stop "STOP0 not_first_run number=$GITHUB_RUN_NUMBER attempt=$GITHUB_RUN_ATTEMPT"
+          # run 1 of this workflow file consumed the first authorization; only run number 2, attempt 1 is accepted here.
+          # Any other dispatch (3, 4, ...) or any re-run attempt (2/2, ...) stops before any fetch or creation.
+          case "$GITHUB_RUN_NUMBER" in ''|*[!0-9]*) rn=invalid ;; *) rn="$GITHUB_RUN_NUMBER" ;; esac
+          case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) ra=invalid ;; *) ra="$GITHUB_RUN_ATTEMPT" ;; esac
+          [ "$rn" = "2" ] && [ "$ra" = "1" ] || stop "STOP0 not_the_authorized_run run_number=$rn run_attempt=$ra accepted_only=2/1"
           [ "$RUNNER_OS" = "Linux" ] && [ "$RUNNER_ARCH" = "X64" ] || stop "STOP0 unexpected_runner"
           # no checkout: the workspace must be empty
           [ -z "$(ls -A "$GITHUB_WORKSPACE")" ] || stop "STOP0 workspace_not_empty"
@@ -581,7 +672,7 @@ jobs:
             sudo sh -c 'command -v "$1"' sh "$t" >/dev/null || stop "STOP0 tool_missing $t"
           done
           python3 -I -c 'import tomllib' || stop "STOP0 python_without_tomllib"
-          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=1 attempt=1"
+          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=$rn run_attempt=$ra accepted_only=2/1"
           echo "STEP0 versions python=$(python3 -I -c 'import platform; print(platform.python_version())') containerd=$(containerd --version | cut -d' ' -f3) dockerd=$(dockerd --version | cut -d' ' -f3 | tr -d ,)"
 
       # ------------------------------------------------------------------ 1. fetch (host network, before any isolation)
@@ -653,7 +744,19 @@ jobs:
           JSON
           sudo sh -c 'ip netns exec "$1" sh "$2" "$3" "$4" </dev/null >/dev/null 2>&1 & echo $! > "$4/launcher.spawn.pid"' sh "$NS" "$RT/engines.sh" "$R" "$RR"
           for i in $(seq 90); do dk version >/dev/null 2>&1 && break; sleep 1; done
-          dk version >/dev/null 2>&1 || stop "STOP2 dedicated_engine_not_ready"
+          # the decisive check is unchanged in effect; its status and stderr class are kept in memory only
+          set +e; rerr="$(dk version 2>&1 >/dev/null)"; rrc=$?; set -e
+          if [ "$rrc" != "0" ]; then
+            case "$rerr" in
+              *"permission denied"*) rcls=permission_denied ;;
+              *"Cannot connect to the Docker daemon"*) rcls=daemon_unreachable ;;
+              *"Error response from daemon"*) rcls=daemon_error_response ;;
+              "") rcls=empty ;;
+              *) rcls=other ;;
+            esac
+            sudo python3 -I "$RT/diag.py" engine - "$R" "$RR" "$(cat "$RT/ns_ino")" "$rrc" "$rcls" || echo "DIAG engine tool_error"
+            stop "STOP2 dedicated_engine_not_ready"
+          fi
           mnt=""
           for n in launcher containerd dockerd; do
             pid="$(sudo cat "$RR/$n.spawn.pid")" || stop "STOP2 engine_pid_missing $n"
