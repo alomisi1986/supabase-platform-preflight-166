@@ -43,6 +43,8 @@ jobs:
           R="/var/lib/pf530"
           RR="/run/pf530"
           EN="/etc/netns/pf530"
+          UNIT="pf530.scope"
+          CGP="/system.slice/pf530.scope"
           SOCKP="/run/pf530/docker.sock"
           SOCK="unix:///run/pf530/docker.sock"
           PROJ="pf530proj"
@@ -210,11 +212,35 @@ jobs:
           PY
 
           cat > "$RT/engines.sh" <<'SH'
-          # One process starts containerd and dockerd as its children: both share one network and one mount namespace.
+          # One process starts containerd and dockerd as its children: both share one network, one mount and one cgroup namespace.
           R="$1"; RR="$2"
+          cgfail() { echo "$1" > "$RR/cgroup.setup"; exit 0; }
+          # 1. claim: this process's PID and the invocation ID that systemd-run handed to the command it started (the ID of
+          #    the unit systemd-run itself was placed in after its own StartTransientUnit call succeeded)
+          case "$INVOCATION_ID" in *[!0-9a-f]*|"") cgfail no_invocation_id ;; esac
+          [ "${#INVOCATION_ID}" = "32" ] || cgfail no_invocation_id
+          { echo "$$ $INVOCATION_ID" > "$RR/launcher.claim.tmp" && mv "$RR/launcher.claim.tmp" "$RR/launcher.claim"; } || cgfail claim_unwritable
+          # 2. nothing changes and no engine starts until the privileged side has bound the scope to this launcher and
+          #    answered with the same invocation ID
+          i=0
+          while [ ! -e "$RR/cgroup.go" ] && [ ! -e "$RR/cgroup.abort" ] && [ "$i" -lt 120 ]; do sleep 1; i=$((i + 1)); done
+          [ -e "$RR/cgroup.go" ] || cgfail not_authorized
+          [ "$(cat "$RR/cgroup.go")" = "$INVOCATION_ID" ] || cgfail authorization_mismatch
+          # 3. cgroup v2 for the engines, limited to the run: this process is in the run's delegated scope and in a new cgroup
+          #    namespace whose root is that scope, so the cgroup2 mount below (in the private mount namespace made by
+          #    ip netns exec) shows only the scope's subtree; the host tree is not mounted here.
+          mount -t cgroup2 -o nosuid,nodev,noexec cgroup2 /sys/fs/cgroup; mrc=$?
           # Facts for the not-ready diagnosis, all inside the run-owned /run/pf530: cgroup filesystem type seen here,
           # the socket wait, and each daemon's wait status recorded by its own wrapper (independent of the other).
           stat -f -c %T /sys/fs/cgroup > "$RR/cgroupfs.type" 2>/dev/null || true
+          [ "$mrc" = "0" ] || cgfail mount_failed
+          # no processes in inner nodes: the launcher moves itself into a leaf, then the scope root hands its controllers down
+          mkdir /sys/fs/cgroup/init || cgfail init_mkdir_failed
+          echo "$$" > /sys/fs/cgroup/init/cgroup.procs || cgfail move_failed
+          sed 's/[^ ][^ ]*/+&/g' /sys/fs/cgroup/cgroup.controllers > /sys/fs/cgroup/cgroup.subtree_control || cgfail enable_failed
+          cat /proc/self/cgroup > "$RR/cgroup.self" || cgfail self_unreadable
+          for e in /sys/fs/cgroup/*/; do e="${e%/}"; echo "${e##*/}"; done > "$RR/cgroup.view" || cgfail view_unreadable
+          echo ok > "$RR/cgroup.setup"
           ( containerd --config "$R/containerd.toml" --root "$R/containerd" --state "$RR/containerd" --address "$RR/containerd/containerd.sock" >"$R/logs/containerd.log" 2>&1 &
             c=$!; echo "$c" > "$RR/containerd.spawn.pid"; wait "$c"; echo "$?" > "$RR/containerd.exit" ) &
           i=0
@@ -297,7 +323,7 @@ jobs:
               sys.exit(3 if any(n.values()) else 0)
           elif mode == "engine":
               # argv: engine - R RR NS_INO DECISIVE_RC DECISIVE_CLASS. Only validated, classified values are printed.
-              import os, stat as statmod
+              import os, stat as statmod, subprocess
               R, RR, NSI, RC, CLS = sys.argv[3:8]
               def rd(name):
                   try:
@@ -337,12 +363,41 @@ jobs:
               cg = "not_recorded" if cg is None else (cg if cg in ("cgroup2fs", "sysfs", "tmpfs", "cgroupfs") else "other")
               st = {n: proc(n, e) for n, e in (("launcher", ("dash", "sh", "bash")), ("containerd", ("containerd",)), ("dockerd", ("dockerd",)))}
               print("DIAG engine decisive_check_rc=%s decisive_check_class=%s" % (
-                  RC if re.fullmatch(r"[0-9]{1,3}", RC) else "invalid",
-                  CLS if CLS in ("permission_denied", "daemon_unreachable", "daemon_error_response", "empty", "other") else "invalid"))
+                  RC if re.fullmatch(r"[0-9]{1,3}", RC) else "not_checked" if RC == "-" else "invalid",
+                  CLS if CLS in ("permission_denied", "daemon_unreachable", "daemon_error_response", "empty", "other", "not_checked") else "invalid"))
               print("DIAG engine launcher=%s containerd=%s dockerd=%s containerd_exit=%s dockerd_exit=%s" % (
                   st["launcher"], st["containerd"], st["dockerd"], exit_of("containerd", st["containerd"]), exit_of("dockerd", st["dockerd"])))
               print("DIAG engine containerd_socket=%s docker_socket=%s containerd_socket_wait=%s cgroupfs_type=%s" % (
                   sock(os.path.join(RR, "containerd", "containerd.sock")), sock(os.path.join(RR, "docker.sock")), sw, cg))
+              # resource boundary: every field is a fixed category; no name read from the system is printed
+              def vocab(v, allowed):
+                  return "not_recorded" if v is None else (v if v in allowed else "other")
+              def unit(p, allowed):
+                  try:
+                      r = subprocess.run(["systemctl", "show", "-p", p, "--value", "pf530.scope"], capture_output=True, text=True, timeout=10)
+                  except (OSError, subprocess.SubprocessError):
+                      return "unreadable"
+                  return "unreadable" if r.returncode else vocab(r.stdout.strip(), allowed)
+              def view(v):
+                  if v is None:
+                      return "not_recorded"
+                  e = v.split()
+                  if e == ["init"]:
+                      return "match"
+                  if not e:
+                      return "empty"
+                  return ("extra_entries:%d" % (len(e) - 1)) if "init" in e else ("missing_init:%d" % len(e))
+              SETUP = ("ok", "no_invocation_id", "claim_unwritable", "not_authorized", "authorization_mismatch", "mount_failed",
+                       "init_mkdir_failed", "move_failed", "enable_failed", "self_unreadable", "view_unreadable")
+              OWNERSHIP = ("owned", "launcher_claim_absent", "launcher_claim_invalid", "launcher_pid_mismatch", "identity_unreadable",
+                           "unit_not_active", "unit_path_unexpected", "identity_mismatch_unit", "cgroup_identity_missing",
+                           "identity_mismatch_cgroup", "launcher_gone", "launcher_not_at_scope_root")
+              le = rd("launcher.err")
+              print("DIAG engine run_scope_load=%s run_scope_active=%s run_scope_ownership=%s cgroup_setup=%s cgroup_view=%s launcher_stderr_lines=%s" % (
+                  unit("LoadState", ("loaded", "not-found", "error", "masked", "bad-setting", "merged", "stub")),
+                  unit("ActiveState", ("active", "inactive", "activating", "deactivating", "failed", "reloading", "maintenance")),
+                  vocab(rd("scope.verdict"), OWNERSHIP), vocab(rd("cgroup.setup"), SETUP), view(rd("cgroup.view")),
+                  "not_recorded" if le is None else len([l for l in le.splitlines() if l.strip()])))
               # untagged startup errors written by dockerd's onError (cmd/dockerd/docker.go) and their wrappers (cmd/dockerd/daemon.go)
               UNTAGGED = [("failed to start daemon, ensure docker is not running", "pidfile_in_use"), ("failed to create pidfile directory", "pidfile"),
                           ("failed to load listeners", "listeners"), ("failed to start API server", "api_server"), ("failed to start daemon", "daemon_init"),
@@ -417,6 +472,128 @@ jobs:
           ROLLBACK;
           SQL
 
+          cat > "$RT/own.py" <<'PY'
+          # Run scope ownership. Pure decision functions (no system access) and one observer; cleanup.py imports this file.
+          # A scope is this run's only when three independent records name the same invocation: the ID systemd-run handed to
+          # the launcher it started, the unit's InvocationID property, and the trusted.invocation_id xattr of the cgroup at the
+          # only accepted path; and the kernel shows the launcher at that cgroup before anything in the tree has changed.
+          import os, re, subprocess, sys
+          UNIT = "pf530.scope"; EXP_CG = "/system.slice/pf530.scope"
+          HEX = re.compile(r"[0-9a-f]{32}")
+          LOADS = ("loaded", "not-found", "error", "masked", "bad-setting", "merged", "stub")
+          ACTIVES = ("active", "inactive", "activating", "deactivating", "failed", "reloading", "maintenance")
+          def prop(unit, name):  # the value, or None when it cannot be read
+              try:
+                  r = subprocess.run(["systemctl", "show", "-p", name, "--value", unit], capture_output=True, text=True, timeout=15)
+              except (OSError, subprocess.SubprocessError):
+                  return None
+              return r.stdout.strip() if r.returncode == 0 else None
+          def xattr(path):  # 'absent' (no cgroup there), 'none' (cgroup without an ID), the ID, or None when unreadable
+              try:
+                  v = os.getxattr(path, "trusted.invocation_id")
+              except FileNotFoundError:
+                  return "absent"
+              except OSError as e:
+                  return "none" if e.errno == 61 else None
+              return v.decode("ascii", "replace").strip("\0")
+          def observe(unit):
+              return prop(unit, "LoadState"), prop(unit, "ActiveState"), prop(unit, "InvocationID"), xattr("/sys/fs/cgroup" + EXP_CG)
+          def decide_start(claim, spawn_pid, load, active, p_inv, p_cg, x_inv, pid_cg):
+              if claim is None:
+                  return "launcher_claim_absent", None
+              t = claim.split()
+              if len(t) != 2 or not t[0].isdigit() or not HEX.fullmatch(t[1]):
+                  return "launcher_claim_invalid", None
+              if spawn_pid is None or t[0] != spawn_pid:
+                  return "launcher_pid_mismatch", None
+              if None in (load, active, p_inv, p_cg, x_inv, pid_cg):
+                  return "identity_unreadable", None
+              if load != "loaded" or active != "active":
+                  return "unit_not_active", None
+              if p_cg != EXP_CG:
+                  return "unit_path_unexpected", None
+              if p_inv != t[1]:
+                  return "identity_mismatch_unit", None
+              if x_inv in ("absent", "none"):
+                  return "cgroup_identity_missing", None
+              if x_inv != t[1]:
+                  return "identity_mismatch_cgroup", None
+              if pid_cg == "absent":
+                  return "launcher_gone", None
+              if pid_cg != "0::%s\n" % EXP_CG:
+                  return "launcher_not_at_scope_root", None
+              return "owned", t[1]
+          def wellformed(load, active, p_inv, x_inv):  # every observed value from its known form, or the observation is not used
+              if load == "not-found" and (active != "inactive" or p_inv not in ("", "0" * 32)):
+                  return False
+              return load in LOADS and active in ACTIVES and (p_inv == "" or bool(HEX.fullmatch(p_inv))) and \
+                  (x_inv in ("absent", "none") or bool(HEX.fullmatch(x_inv)))
+          def gone(rec_inv, load, active, p_inv, x_inv):
+              # positive evidence that the run's scope no longer exists: no cgroup at the only accepted path, and either no unit
+              # under the name or only our own invocation, ended. A cgroup still present (with any or no ID) is never "gone",
+              # and a process count of zero is not evidence that a remaining empty cgroup has been removed.
+              return x_inv == "absent" and (load == "not-found" or (p_inv == rec_inv and active in ("inactive", "failed")))
+          def decide_cleanup(rec_inv, load, active, p_inv, x_inv):  # (action, state); action is 'stop' only for a proven scope
+              if rec_inv is None or not HEX.fullmatch(rec_inv):
+                  return "none", "record_invalid"
+              if None in (load, active, p_inv, x_inv):
+                  return "none", "unreadable"
+              if not wellformed(load, active, p_inv, x_inv):
+                  return "none", "malformed"
+              if gone(rec_inv, load, active, p_inv, x_inv):
+                  return "none", "absent"
+              if p_inv == rec_inv and x_inv == rec_inv:
+                  return "stop", "owned"
+              return "none", "identity_mismatch"
+          def verify_scope(rec_inv, load, active, p_inv, x_inv):  # (verified, state): verified only on positive evidence
+              if None in (load, active, p_inv, x_inv):
+                  return False, "unverifiable"
+              if rec_inv is None or not HEX.fullmatch(rec_inv):
+                  return False, "record_invalid"
+              if not wellformed(load, active, p_inv, x_inv):
+                  return False, "malformed"
+              if gone(rec_inv, load, active, p_inv, x_inv):
+                  return True, "absent"
+              if x_inv == rec_inv or (p_inv == rec_inv and active not in ("inactive", "failed")):
+                  return False, "present"
+              # anything else (cgroup left without an ID, unit and cgroup naming other or different IDs, a replacement that may
+              # or may not be someone else's) is not resolved here and stays unverified
+              return False, "unresolved_identity"
+          def verify_unproven(load, active, p_inv, x_inv):  # an intent without a proven identity: never acted on
+              if None in (load, active, p_inv, x_inv):
+                  return False, "unverifiable"
+              if not wellformed(load, active, p_inv, x_inv):
+                  return False, "malformed"
+              if load == "not-found" and x_inv == "absent":
+                  return True, "absent"
+              return False, "present_identity_unproven"
+          if __name__ == "__main__":
+              rr = sys.argv[2]
+              def rd(n):
+                  try:
+                      return open(os.path.join(rr, n)).read().strip()
+                  except FileNotFoundError:
+                      return None
+              claim, sp = rd("launcher.claim"), rd("launcher.spawn.pid")
+              pid = claim.split()[0] if claim and claim.split() and claim.split()[0].isdigit() else None
+              pid_cg = None
+              if pid:
+                  try:
+                      pid_cg = open("/proc/%s/cgroup" % pid).read()
+                  except FileNotFoundError:
+                      pid_cg = "absent"
+                  except OSError:
+                      pid_cg = None
+              load, active, p_inv, x_inv = observe(UNIT)
+              code, inv = decide_start(claim, sp, load, active, p_inv, prop(UNIT, "ControlGroup"), x_inv, pid_cg)
+              open(os.path.join(rr, "scope.verdict"), "w").write(code + "\n")
+              print("STEP2 run_scope ownership=%s" % code)
+              if code != "owned":
+                  sys.exit(3)
+              open(os.path.join(rr, "scope.verified"), "w").write(inv + "\n")
+              print("STEP2 run_scope unit=%s path=%s invocation_sources=launcher,unit,cgroup_xattr agree=yes launcher_at_scope_root=yes" % (UNIT, EXP_CG))
+          PY
+
           cat > "$RT/compare.py" <<'PY'
           # Exit 5: evidence incomplete or invalid. Exit 0: complete; each item is MATCH, DIFF, ABSENT or MEASURED.
           import sys
@@ -483,6 +660,9 @@ jobs:
           # Cleanup from the ledger only: a resource is acted on only while its recorded identity still matches.
           import grp, os, pwd, signal, subprocess, sys, time
           ledger, rt = sys.argv[1], sys.argv[2]
+          import importlib.util
+          _spec = importlib.util.spec_from_file_location("own", os.path.join(rt, "own.py")); own = importlib.util.module_from_spec(_spec)
+          _spec.loader.exec_module(own)
           SOCK = "unix:///run/pf530/docker.sock"; R = "/var/lib/pf530"; RR = "/run/pf530"
           def parse():
               out = []
@@ -575,6 +755,15 @@ jobs:
                   run("rm_container_" + c[:12], ["docker", "-H", SOCK, "rm", "-f", c])
               reap(n)
               run("netns_delete_" + n, ["ip", "netns", "del", n])
+          # 2b. the run scope, only with proven ownership: stopping it ends every process left in its cgroup subtree
+          #     (engines, shims, containers) and systemd then removes the subtree. Any other state: no action.
+          #     systemctl stops by name only: the identity read just before the stop cannot be bound to the stop request itself.
+          for _, u, d in rec("scope"):
+              act, state = own.decide_cleanup(d.get("inv"), *own.observe(u))
+              if act == "stop":
+                  run("scope_stop_" + u, ["systemctl", "stop", u])
+              else:
+                  print("CLEANUP scope=%s %s no_action" % (u, state))
           # 3. paths, newest first, each only if its recorded inode still matches
           for _, p, d in reversed(rec("path")):
               cur = ino(p)
@@ -622,7 +811,10 @@ jobs:
           done = {(k, n) for k, n, _ in ent}
           for _, _, d in rec("intent"):
               k, t = d.get("kind"), d.get("target")
-              if (k, t) not in done:
+              if (k, t) not in done and k == "scope":
+                  ok, state = own.verify_unproven(*own.observe(t))
+                  note("unproven_scope:" + t, ok, state)
+              elif (k, t) not in done:
                   exists = (ino(t) is not None) if k == "path" else (nsino(t) is not None) if k == "netns" else (t in [p.pw_name for p in pwd.getpwall()])
                   note("unproven_%s:%s" % (k, t), not exists, "present_identity_unproven" if exists else "absent")
           for k, n, d in ent:
@@ -633,8 +825,12 @@ jobs:
               elif k == "user":
                   present = n in [p.pw_name for p in pwd.getpwall()] or n in [g.gr_name for g in grp.getgrall()]
                   note("user_and_group:" + n, not present, "present" if present else "absent")
+              elif k == "scope":
+                  ok, state = own.verify_scope(d.get("inv"), *own.observe(n))
+                  note("scope:" + n, ok, state)
           nsi = [d.get("ino") for k, _, d in ent if k == "netns"]
           cids = [d.get("id") for k, _, d in ent if k == "container"]
+          cgs = [d.get("cg") for k, _, d in ent if k == "scope"]
           procs = 0
           for p in os.listdir("/proc"):
               if not p.isdigit():
@@ -645,7 +841,8 @@ jobs:
                   net = os.readlink("/proc/%s/ns/net" % p)
               except OSError:
                   continue
-              if (R in cmd or RR in cmd) or any(c and c in cg for c in cids) or any(i and net == "net:[%s]" % i for i in nsi):
+              if (R in cmd or RR in cmd) or any(c and c in cg for c in cids) or any(i and net == "net:[%s]" % i for i in nsi) \
+                      or any(s and ("0::%s\n" % s in cg or "0::%s/" % s in cg) for s in cgs):
                   procs += 1
           note("processes_of_run", procs == 0, "count=%d" % procs)
           mounts = [l.split()[4] for l in open("/proc/self/mountinfo").read().splitlines()]
@@ -657,23 +854,23 @@ jobs:
           PY
 
           . "$RT/lib.sh"
-          for f in lib.sh regfetch.py probe.py engines.sh cfg.py diag.py measure.sql compare.py cleanup.py; do
+          for f in lib.sh regfetch.py probe.py engines.sh cfg.py diag.py own.py measure.sql compare.py cleanup.py; do
             echo "STEP0 helper $f sha256=$(sha256sum "$RT/$f" | cut -c1-64)"
           done
-          # run 1 of this workflow file consumed the first authorization; only run number 2, attempt 1 is accepted here.
-          # Any other dispatch (3, 4, ...) or any re-run attempt (2/2, ...) stops before any fetch or creation.
+          # runs 1 and 2 of this workflow file consumed the first two authorizations; only run number 3, attempt 1 is accepted here.
+          # Any other dispatch (4, 5, ...) or any re-run attempt (3/2, ...) stops before any fetch or creation.
           case "$GITHUB_RUN_NUMBER" in ''|*[!0-9]*) rn=invalid ;; *) rn="$GITHUB_RUN_NUMBER" ;; esac
           case "$GITHUB_RUN_ATTEMPT" in ''|*[!0-9]*) ra=invalid ;; *) ra="$GITHUB_RUN_ATTEMPT" ;; esac
-          [ "$rn" = "2" ] && [ "$ra" = "1" ] || stop "STOP0 not_the_authorized_run run_number=$rn run_attempt=$ra accepted_only=2/1"
+          [ "$rn" = "3" ] && [ "$ra" = "1" ] || stop "STOP0 not_the_authorized_run run_number=$rn run_attempt=$ra accepted_only=3/1"
           [ "$RUNNER_OS" = "Linux" ] && [ "$RUNNER_ARCH" = "X64" ] || stop "STOP0 unexpected_runner"
           # no checkout: the workspace must be empty
           [ -z "$(ls -A "$GITHUB_WORKSPACE")" ] || stop "STOP0 workspace_not_empty"
-          for t in ip python3 containerd dockerd docker ss setpriv useradd userdel groupdel curl sha256sum tar; do
+          for t in ip python3 containerd dockerd docker ss setpriv useradd userdel groupdel curl sha256sum tar stat mount unshare systemd-run systemctl; do
             sudo sh -c 'command -v "$1"' sh "$t" >/dev/null || stop "STOP0 tool_missing $t"
           done
           python3 -I -c 'import tomllib' || stop "STOP0 python_without_tomllib"
-          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=$rn run_attempt=$ra accepted_only=2/1"
-          echo "STEP0 versions python=$(python3 -I -c 'import platform; print(platform.python_version())') containerd=$(containerd --version | cut -d' ' -f3) dockerd=$(dockerd --version | cut -d' ' -f3 | tr -d ,)"
+          echo "STEP0 runner=Linux/X64 workspace_empty=yes run_number=$rn run_attempt=$ra accepted_only=3/1"
+          echo "STEP0 versions python=$(python3 -I -c 'import platform; print(platform.python_version())') containerd=$(containerd --version | cut -d' ' -f3) dockerd=$(dockerd --version | cut -d' ' -f3 | tr -d ,) systemd=$(systemctl --version | sed -n '1s/^systemd \([0-9]*\).*/\1/p') kernel=$(uname -r)"
 
       # ------------------------------------------------------------------ 1. fetch (host network, before any isolation)
       - name: 1-fetch-and-verify
@@ -708,6 +905,10 @@ jobs:
           if getent passwd "$TU" >/dev/null || getent group "$TU" >/dev/null; then stop "STOP2 test_user_or_group_exists"; fi
           [ ! -e "/run/netns/$NS" ] || stop "STOP2 netns_exists"
           for p in "$R" "$RR" "$EN"; do [ ! -e "$p" ] || stop "STOP2 path_exists $p"; done
+          hfs="$(stat -f -c %T /sys/fs/cgroup)" || stop "STOP2 host_cgroup_unreadable"
+          [ "$hfs" = "cgroup2fs" ] || stop "STOP2 host_cgroup_not_v2"
+          uls="$(systemctl show -p LoadState --value "$UNIT")" || stop "STOP2 run_scope_state_unreadable"
+          [ "$uls" = "not-found" ] || stop "STOP2 run_scope_name_in_use"
           # 2b. test user: own group only, no docker group, no login
           led "intent pf530 kind=user target=$TU"
           sudo useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$TU" || stop "STOP2 useradd"
@@ -733,16 +934,33 @@ jobs:
           echo "STEP2 step_shell_netns=$(readlink /proc/self/ns/net) test_netns=net:[$(cat "$RT/ns_ino")]"
           python3 -I "$RT/probe.py" host || true
           probe pre_engine STOP2
-          # 2e. one launcher process starts both engines inside the namespace (one mount namespace for both)
+          # 2e. one launcher process starts both engines inside the namespace (one mount namespace for both), in the run's
+          #     transient systemd scope with delegation and in its own cgroup namespace rooted at that scope.
+          #     cgroupfs driver: on a cgroup v2 host running systemd the engine would otherwise default to the systemd driver
+          #     and have container cgroups created by systemd outside the run's subtree.
           printf 'version = 2\ndisabled_plugins = ["io.containerd.grpc.v1.cri"]\n' | sudo tee "$R/containerd.toml" >/dev/null
           sudo tee "$R/daemon.json" >/dev/null <<'JSON'
           {"data-root": "/var/lib/pf530/docker", "exec-root": "/run/pf530/docker-exec", "pidfile": "/run/pf530/dockerd.pid",
            "hosts": ["unix:///run/pf530/docker.sock"], "group": "pf530", "containerd": "/run/pf530/containerd/containerd.sock",
            "containerd-namespace": "pf530", "containerd-plugins-namespace": "pf530-plugins",
-           "storage-driver": "overlay2", "features": {"containerd-snapshotter": false},
+           "storage-driver": "overlay2", "features": {"containerd-snapshotter": false}, "exec-opts": ["native.cgroupdriver=cgroupfs"],
            "dns": ["127.0.0.1"], "ipv6": false, "live-restore": false}
           JSON
-          sudo sh -c 'ip netns exec "$1" sh "$2" "$3" "$4" </dev/null >/dev/null 2>&1 & echo $! > "$4/launcher.spawn.pid"' sh "$NS" "$RT/engines.sh" "$R" "$RR"
+          led "intent pf530 kind=scope target=$UNIT"
+          # systemd-run starts the unit in mode "fail": an existing unit of that name makes it exit without starting anything
+          sudo sh -c 'systemd-run --quiet --scope --collect --slice=system.slice --unit="$5" -p Delegate=yes -p TimeoutStopSec=30 -- unshare --cgroup -- ip netns exec "$1" sh "$2" "$3" "$4" </dev/null >/dev/null 2>"$4/launcher.err" & echo $! > "$4/launcher.spawn.pid"' sh "$NS" "$RT/engines.sh" "$R" "$RR" "$UNIT"
+          # 2e'. bind the scope to this launcher before anything changes in its tree; the launcher waits for the answer
+          for i in $(seq 30); do sudo test -s "$RR/launcher.claim" && break; sleep 1; done
+          set +e; sudo python3 -I "$RT/own.py" start "$RR"; orc=$?; set -e
+          if [ "$orc" != "0" ]; then
+            sudo sh -c ': > "$1/cgroup.abort"' sh "$RR" || true
+            sudo python3 -I "$RT/diag.py" engine - "$R" "$RR" "$(cat "$RT/ns_ino")" - not_checked || echo "DIAG engine tool_error"
+            [ "$orc" = "3" ] && stop "STOP2 run_scope_not_owned"
+            stop "STOP2 ownership_tool_error rc=$orc"
+          fi
+          inv="$(sudo cat "$RR/scope.verified")" || stop "STOP2 ownership_record_unreadable"
+          led "scope $UNIT cg=$CGP inv=$inv"
+          sudo sh -c 'printf "%s\n" "$1" > "$2/cgroup.go.tmp" && mv "$2/cgroup.go.tmp" "$2/cgroup.go"' sh "$inv" "$RR" || stop "STOP2 authorization_unwritable"
           for i in $(seq 90); do dk version >/dev/null 2>&1 && break; sleep 1; done
           # the decisive check is unchanged in effect; its status and stderr class are kept in memory only
           set +e; rerr="$(dk version 2>&1 >/dev/null)"; rrc=$?; set -e
@@ -757,19 +975,35 @@ jobs:
             sudo python3 -I "$RT/diag.py" engine - "$R" "$RR" "$(cat "$RT/ns_ino")" "$rrc" "$rcls" || echo "DIAG engine tool_error"
             stop "STOP2 dedicated_engine_not_ready"
           fi
-          mnt=""
+          mnt=""; cns=""
+          hcns="$(readlink /proc/self/ns/cgroup)" || stop "STOP2 step_cgroupns_unreadable"
           for n in launcher containerd dockerd; do
             pid="$(sudo cat "$RR/$n.spawn.pid")" || stop "STOP2 engine_pid_missing $n"
             net="$(sudo readlink "/proc/$pid/ns/net")" || stop "STOP2 engine_process_gone $n"
             m="$(sudo readlink "/proc/$pid/ns/mnt")" || stop "STOP2 engine_process_gone $n"
+            c="$(sudo readlink "/proc/$pid/ns/cgroup")" || stop "STOP2 engine_process_gone $n"
+            g="$(sudo cat "/proc/$pid/cgroup")" || stop "STOP2 engine_process_gone $n"
             [ "$net" = "net:[$(cat "$RT/ns_ino")]" ] || stop "STOP2 engine_outside_test_netns $n"
             [ -z "$mnt" ] || [ "$m" = "$mnt" ] || stop "STOP2 engines_in_different_mount_namespaces"
-            mnt="$m"; echo "STEP2 $n pid=$pid netns=$net mntns=$m"
+            [ "$c" != "$hcns" ] || stop "STOP2 engine_in_host_cgroup_namespace $n"
+            [ -z "$cns" ] || [ "$c" = "$cns" ] || stop "STOP2 engines_in_different_cgroup_namespaces"
+            [ "$g" = "0::$CGP/init" ] || stop "STOP2 engine_outside_run_scope $n"
+            mnt="$m"; cns="$c"; echo "STEP2 $n pid=$pid netns=$net mntns=$m cgroupns=$c cgroup=run_scope/init"
           done
           led "engine pf530 launcher=$(sudo cat "$RR/launcher.spawn.pid") containerd=$(sudo cat "$RR/containerd.spawn.pid") dockerd=$(sudo cat "$RR/dockerd.spawn.pid") mnt=$mnt"
           echo "STEP2 step_shell_mntns=$(readlink /proc/self/ns/mnt)"
-          info="$(dk info --format '{{.DockerRootDir}}|{{.Driver}}|{{.Containers}}|{{.Images}}')" || stop "STOP2 engine_query"
-          [ "$info" = "/var/lib/pf530/docker|overlay2|0|0" ] || stop "STOP2 dedicated_engine_state $info"
+          # 2e''. the engines' resource view: their own record from inside, and the scope as the host sees it.
+          #      A read is checked first; only a successful read can count as empty.
+          cgv="$(sudo cat "$RR/cgroup.setup" "$RR/cgroupfs.type" "$RR/cgroup.self" "$RR/cgroup.view" | tr '\n' ' ')" || stop "STOP2 engine_cgroup_record_missing"
+          [ "$cgv" = "ok cgroup2fs 0::/init init " ] || stop "STOP2 engine_cgroup_view_not_as_declared"
+          rp="$(sudo cat "/sys/fs/cgroup$CGP/cgroup.procs")" || stop "STOP2 run_scope_procs_unreadable"
+          [ -z "$rp" ] || stop "STOP2 run_scope_root_not_empty"
+          sc="$(sudo cat "/sys/fs/cgroup$CGP/cgroup.subtree_control")" || stop "STOP2 run_scope_unreadable"
+          case " $sc " in *" memory "*) ;; *) stop "STOP2 run_scope_controller_missing memory" ;; esac
+          case " $sc " in *" pids "*) ;; *) stop "STOP2 run_scope_controller_missing pids" ;; esac
+          echo "STEP2 cgroup host_fs=cgroup2fs scope=$UNIT scope_path=$CGP host_cgroupns=$hcns engines_fs=cgroup2fs engines_self=init engines_view=match scope_root_procs=0 subtree_has=memory,pids"
+          info="$(dk info --format '{{.DockerRootDir}}|{{.Driver}}|{{.Containers}}|{{.Images}}|{{.CgroupDriver}}|{{.CgroupVersion}}')" || stop "STOP2 engine_query"
+          [ "$info" = "/var/lib/pf530/docker|overlay2|0|0|cgroupfs|2" ] || stop "STOP2 dedicated_engine_state"
           vols="$(dk volume ls -q)" || stop "STOP2 engine_query"
           [ -z "$vols" ] || stop "STOP2 dedicated_engine_not_empty"
           nets="$(dk network ls --format '{{.Name}}' | sort | tr '\n' ' ')" || stop "STOP2 engine_query"
@@ -794,6 +1028,7 @@ jobs:
           echo "STEP2 network id=$nid config=$ncfg"
           [ "$ncfg" = "$NET|bridge|127.0.0.1|false" ] || stop "STOP2 network_not_as_declared"
           probe post_engine STOP2
+          echo "STEP2 engine_ready cgroup_version=2 cgroup_driver=cgroupfs scope=$UNIT (engine readiness only; no database started)"
 
       # ------------------------------------------------------------------ 3. official init + declared configuration
       - name: 3-configure
@@ -862,6 +1097,11 @@ jobs:
           meta="$(dk inspect --format '{{.Name}}|{{.Image}}|{{index .Config.Labels "com.supabase.cli.project"}}|{{.State.Running}}|{{.HostConfig.NetworkMode}}|{{.HostConfig.Privileged}}|{{.HostConfig.PidMode}}' "$CID")" || stop "STOP5 inspect"
           echo "STEP5 db_container id=$CID meta=$meta"
           [ "$meta" = "/supabase_db_$PROJ|$exp|$PROJ|true|$NET|false|" ] || stop "STOP5 db_container_identity"
+          cgp="$(awk '$1 == "scope" {sub(/^cg=/, "", $3); print $3}' "$LEDGER")" || stop "STOP5 ledger_unreadable"
+          cpid="$(dk inspect --format '{{.State.Pid}}' "$CID")" || stop "STOP5 inspect"
+          ccg="$(sudo cat "/proc/$cpid/cgroup")" || stop "STOP5 db_container_process_gone"
+          [ "$cgp" = "$CGP" ] && [ "$ccg" = "0::$CGP/docker/$CID" ] || stop "STOP5 db_container_outside_run_scope"
+          echo "STEP5 db_container cgroup=run_scope/docker/CID within_run_scope=yes"
           attached="$(dk inspect --format '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}={{$v.NetworkID}} {{end}}' "$CID")" || stop "STOP5 inspect"
           [ "$attached" = "$NET=$nid " ] || stop "STOP5 db_container_not_on_run_network"
           ncfg="$(dk network inspect --format '{{index .Options "com.docker.network.bridge.host_binding_ipv4"}}' "$nid")" || stop "STOP5 network_inspect"
